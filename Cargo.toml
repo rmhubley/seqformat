@@ -1,0 +1,22 @@
+[package]
+name = "seqformat"
+version = "0.1.0"
+edition = "2021"
+description = "Read/write UCSC twoBit (standard + long + IUB extension) and BWA-style 4-bit sequence formats, with FASTA conversion."
+
+# The twoBit/4bit/FASTA codecs are std-only. The samtools (bgzip/BGZF) format
+# needs a DEFLATE codec; we use libdeflater (Rust bindings to the C libdeflate
+# library that htslib itself uses). This needs a C compiler at build time.
+[dependencies]
+libdeflater = "1"
+
+[[bin]]
+name = "seqformat"
+path = "src/main.rs"
+
+[lib]
+name = "seqformat"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3

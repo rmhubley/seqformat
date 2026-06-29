@@ -1,0 +1,9 @@
+# Claude Code local files
+.claude/
+
+# Rust build artifacts
+/target/
+
+# Benchmark working directories
+/bench/work/
+/bench/manywork/
