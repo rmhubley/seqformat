@@ -73,30 +73,38 @@ ambiguity), `info`.
 
   | format | ms/fetch | req/fetch | KiB/fetch |
   |---|--:|--:|--:|
-  | 2bit std (flat TOC)     | 217 | 3.9  | 6743 |
-  | 2bit idx (sorted array) |  51 | 21.7 |  170 |
-  | **2be (B+ tree)**       | **16** | **7.0** | **49** |
+  | 2bit std (flat TOC)     | 240 | 3.9  | 6743 |
+  | 2bit idx (sorted array) |  82 | 21.7 |  170 |
+  | **2be (B+ tree)**       | **22** | **7.0** | **49** |
 
-  The story from the theory holds: flat TOC pulls O(N) bytes (whole TOC) every
-  open; the sorted index does ~log₂N *scattered* probes (poor locality — a
-  block-size sweep leaves it at ~15–25 requests); the **2be on-disk B+ tree
-  (fan-out 256, `bptree::find_src`) hits the ideal ~3-node lookup**, so it wins
-  both latency and bytes. 4bit (no index) is O(N) on open — ~10k req / 84 MiB, it
-  scans every interleaved record header. faidx loads the whole `.fai` sidecar
-  (O(N)) then does a single window read (plain) or scans BGZF block headers
+  (ms/fetch varies with the network; req/bytes are stable.) The story from the
+  theory holds: flat TOC pulls O(N) bytes (whole TOC) every open; the sorted index
+  does ~log₂N *scattered* probes (poor locality — a block-size sweep leaves it at
+  ~15–25 requests); the **2be on-disk B+ tree (fan-out 256, `bptree::find_src`)
+  hits the ideal ~3-node lookup**, so it wins both latency and bytes. 4bit (no
+  index) is O(N) on open — ~10k req / 84 MiB, it scans every interleaved record
+  header. faidx pulls its whole `.fai` (~1.37 MiB for 50k seqs — folded into
+  `--http-stats`) then a window read (plain) or a BGZF block-header scan
   (O(blocks)). Benchmarked by `bench/webseq.sh`.
+
+  **Local per-fetch** now matches: `cmd_extract` routes single-region 2be through
+  the seek path too (was slurping), so 2be local dropped **37 ms → 1.4 ms**,
+  tying the sorted index (1.4 ms); BGZF (seqformat) few-big dropped **95 → 8 ms**.
+  4bit stays slurp-based (no index → one sequential read beats O(N) seeks).
 
 ## Known limitations / candidate next steps
 - **All readers are now Source-backed (seek + HTTP range reads)** — `twobit`,
   `twobyte` (2be), `fourbit`, and `samtools`/BGZF share `src/source.rs`. The old
   whole-file slurp on open is gone; local single-fetch is seek-based and remote
-  is range-based. 2be's local per-fetch should now match ~1 ms (was ~37 ms when
-  it slurped) — worth re-running `manyseq.sh` to refresh those numbers.
+  is range-based.
 - HTTP `Source` adds a `ureq` (rustls) dependency; could be gated behind an
   optional `http` cargo feature to keep the default build std-only + libdeflater.
   Remote is `http(s)` only (no `ftp`/`s3`). faidx requires a `.fai` sidecar
   remotely (the scan fallback would defeat range access); remote BGZF scans block
   headers (O(blocks)) rather than reading a `.gzi`.
+- Minor: 2be *bulk* (>1024 regions, slurp path) is ~0.5 s vs ~0.1 s for the 2bit
+  family — `Source::Mem` allocates a Vec per positioned read, so the many-edit 2be
+  decode does more small allocs. Per-fetch (seek) path is unaffected.
 - Flat-TOC (non-indexed) 2bit still builds a `String` HashMap of all names when a
   name is looked up without the index → 164 ms on 500k seqs. The `--index` format
   removes it; plain 2bit could also lazily binary-search a seek-read TOC.

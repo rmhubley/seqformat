@@ -254,6 +254,10 @@ pub struct FaidxReader {
     bgzf_blocks: Option<Vec<Block>>, // None => plain FASTA
     by_name: HashMap<String, FaiRec>,
     order: Vec<String>,
+    /// `(requests, bytes)` spent fetching the remote `.fai` sidecar on open —
+    /// its own `Source`, folded into `http_stats` so the reported cost includes
+    /// the index load (the analogue of a flat-TOC pull), not just window reads.
+    fai_http: (u64, u64),
 }
 
 impl FaidxReader {
@@ -269,7 +273,7 @@ impl FaidxReader {
         } else {
             build_fai_by_scan_src(&src, &bgzf_blocks)?
         };
-        Ok(Self::assemble(src, bgzf_blocks, recs))
+        Ok(Self::assemble(src, bgzf_blocks, recs, (0, 0)))
     }
 
     /// Open a remote `http(s)://` indexed FASTA over HTTP range reads. The
@@ -283,31 +287,40 @@ impl FaidxReader {
 
     pub(crate) fn from_source(src: Source) -> Result<Self> {
         let bgzf_blocks = detect_bgzf(&src)?;
-        let recs = match src.url() {
+        let (recs, fai_http) = match src.url() {
             Some(u) => {
                 let fai = Source::from_url(&format!("{u}.fai"))
                     .map_err(|e| Error::Format(format!("{u}.fai (required for remote faidx): {e}")))?;
                 let text = fai.bytes_at(0, fai.len())?;
-                parse_fai(&String::from_utf8_lossy(&text))?
+                // The .fai is its own Source; fold its cost into ours so the
+                // reported total includes the index load, not just window reads.
+                (parse_fai(&String::from_utf8_lossy(&text))?, fai.http_stats().unwrap_or((0, 0)))
             }
-            None => build_fai_by_scan_src(&src, &bgzf_blocks)?,
+            None => (build_fai_by_scan_src(&src, &bgzf_blocks)?, (0, 0)),
         };
-        Ok(Self::assemble(src, bgzf_blocks, recs))
+        Ok(Self::assemble(src, bgzf_blocks, recs, fai_http))
     }
 
-    fn assemble(src: Source, bgzf_blocks: Option<Vec<Block>>, recs: Vec<FaiRec>) -> Self {
+    fn assemble(
+        src: Source,
+        bgzf_blocks: Option<Vec<Block>>,
+        recs: Vec<FaiRec>,
+        fai_http: (u64, u64),
+    ) -> Self {
         let mut by_name = HashMap::with_capacity(recs.len());
         let mut order = Vec::with_capacity(recs.len());
         for r in recs {
             order.push(r.name.clone());
             by_name.insert(r.name.clone(), r);
         }
-        FaidxReader { src, bgzf_blocks, by_name, order }
+        FaidxReader { src, bgzf_blocks, by_name, order, fai_http }
     }
 
-    /// `(requests, bytes)` issued so far over HTTP; `None` for local/in-memory.
+    /// `(requests, bytes)` issued so far over HTTP, **including** the one-time
+    /// `.fai` sidecar download (the index load); `None` for local/in-memory.
     pub fn http_stats(&self) -> Option<(u64, u64)> {
-        self.src.http_stats()
+        let (r, b) = self.src.http_stats()?;
+        Some((r + self.fai_http.0, b + self.fai_http.1))
     }
 
     pub fn names(&self) -> &[String] {
@@ -384,7 +397,7 @@ impl crate::SeqReader for FaidxReader {
         FaidxReader::extract(self, name, start, end)
     }
     fn http_stats(&self) -> Option<(u64, u64)> {
-        self.src.http_stats()
+        FaidxReader::http_stats(self)
     }
 }
 

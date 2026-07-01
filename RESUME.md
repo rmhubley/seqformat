@@ -39,15 +39,20 @@ $BIN extract $B/seqformat.2be seq250000 --http-stats >/dev/null   # ~7 req / ~50
 FETCHES=15 bash bench/webseq.sh
 ```
 
+## Done since first checkpoint
+- Final all-formats validation sweep: **passed** (remote==local for all).
+- `cmd_extract` now routes single-region **2be** through the seek path (was
+  slurping) → 2be local per-fetch **37 ms → 1.4 ms**; BGZF few-big **95 → 8 ms**.
+- Remote **`.fai` fetch folded into `http_stats`** (FaidxReader.fai_http) — faidx
+  web cost now honestly includes the index load (~1.37 MiB plain 50k).
+- Benchmarks re-run (manyseq, benchmark, webseq); README + STATUS tables refreshed.
+
 ## Pending / candidate next steps
-- **Interrupted**: the final all-formats validation sweep did not finish running
-  (was cut off to save state) — re-run the block above to confirm.
 - Gate `ureq` behind an optional `http` cargo feature so the default build stays
   std-only + libdeflater (cfg the URL paths + `open_url`).
-- Re-run `manyseq.sh` to refresh **local** 2be per-fetch (should now be ~1 ms
-  since 2be seeks instead of slurping; old tables say ~37 ms).
-- `.fai` fetch for remote faidx uses a *separate* `Source`, so its bytes aren't
-  in `http_stats` — consider folding it in for honest accounting.
+- Minor: 2be *bulk* (slurp path) ~0.5 s vs ~0.1 s for 2bit family —
+  `Source::Mem` allocates per positioned read. Seek path unaffected. A Mem
+  fast-path returning slices would fix it.
 - Optional: `.gzi`-based BGZF seek (avoid the O(blocks) header scan).
 
 ## Git

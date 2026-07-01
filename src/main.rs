@@ -344,30 +344,34 @@ fn cmd_extract(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    // Peek only a small prefix for format detection so a 2bit file isn't slurped
-    // into memory just to fetch one region — the 2bit reader then opens it with
-    // seek+read. Other formats keep their existing whole-file path.
+    // Peek only a small prefix for format detection so an indexed file isn't
+    // slurped into memory just to fetch one region — the reader then opens it
+    // seek-based. A few regions (per-fetch / "grab one contig") open seek-based
+    // for minimal latency; a large batch or extract-all amortises a single
+    // whole-file read, which beats thousands of per-region seeks.
     let prefix = read_prefix(file, 64)?;
+    let bulk = regions.is_empty() || regions.len() > 1024;
     let out_seqs: Vec<seqformat::Sequence> = if twobit::is_twobit(&prefix) {
-        // A few regions (the per-fetch / "grab one contig" case) open seek-based
-        // for minimal latency; a large batch or extract-all amortises a single
-        // whole-file read, which beats thousands of per-region seeks.
-        if regions.is_empty() || regions.len() > 1024 {
+        if bulk {
             run!(twobit::TwoBitReader::from_vec(std::fs::read(file)?)?)
         } else {
             run!(twobit::TwoBitReader::open(file)?)
         }
-    } else {
-        let data = std::fs::read(file)?;
-        if twobyte::is_twobyte(&data) {
-            run!(twobyte::TwoByteReader::from_vec(data)?)
-        } else if fourbit::is_fourbit(&data) {
-            run!(fourbit::FourBitReader::from_vec(data)?)
-        } else if samtools::is_bgzf(&data) || samtools::is_fasta(&data) {
-            run!(samtools::FaidxReader::open(file)?)
+    } else if twobyte::is_twobyte(&prefix) {
+        // 2be carries an on-disk B+ tree, so a seek-open lookup is O(log N).
+        if bulk {
+            run!(twobyte::TwoByteReader::from_vec(std::fs::read(file)?)?)
         } else {
-            run!(twobit::TwoBitReader::from_vec(data)?)
+            run!(twobyte::TwoByteReader::open(file)?)
         }
+    } else if fourbit::is_fourbit(&prefix) {
+        // 4bit has no index: a lookup must touch every record header either way,
+        // so one sequential slurp beats O(N) scattered seeks.
+        run!(fourbit::FourBitReader::from_vec(std::fs::read(file)?)?)
+    } else if samtools::is_bgzf(&prefix) || samtools::is_fasta(&prefix) {
+        run!(samtools::FaidxReader::open(file)?)
+    } else {
+        run!(twobit::TwoBitReader::from_vec(std::fs::read(file)?)?)
     };
 
     write_extract_output(o.vals.get("out"), &out_seqs, width)
