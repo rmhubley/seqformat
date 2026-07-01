@@ -28,6 +28,7 @@
 use crate::error::{fmt_err, Result};
 use crate::io::{peek_u32, put_u32, put_u64, put_u8, Reader};
 use crate::seq::{base_to_nibble, nibble_to_base, Sequence};
+use crate::source::Source;
 use std::fs;
 use std::path::Path;
 
@@ -105,11 +106,14 @@ pub fn from_bytes(data: &[u8]) -> Result<Vec<Sequence>> {
     Ok(seqs)
 }
 
-/// Random-access reader for the 4-bit container. The container has no offset
-/// table, so `open` scans the records once to build an in-memory index; after
-/// that `extract` decodes only the requested window.
+/// Random-access reader for the 4-bit container (local file, memory, or remote
+/// HTTP). The container has no offset table, so `from_source` scans the records
+/// once to build an in-memory index; after that `extract` decodes only the
+/// requested window. Note: that scan touches every record header, which are
+/// interleaved with the packed data — so over HTTP, building the index is
+/// inherently O(N) (the format carries no index to seek through).
 pub struct FourBitReader {
-    data: Vec<u8>,
+    src: Source,
     /// name -> (packed_start_byte, length_in_bases)
     by_name: std::collections::HashMap<String, (usize, usize)>,
     order: Vec<String>,
@@ -117,35 +121,49 @@ pub struct FourBitReader {
 
 impl FourBitReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::from_vec(fs::read(path)?)
+        Self::from_source(Source::from_path(path)?)
     }
 
     pub fn from_vec(data: Vec<u8>) -> Result<Self> {
-        if data.len() < 16 || peek_u32(&data, 0, true) != Some(MAGIC) {
+        Self::from_source(Source::Mem(data))
+    }
+
+    /// Open a remote `http(s)://` 4-bit file over HTTP range reads (UDC-style).
+    /// `extract` then fetches only the requested window, but see the note on the
+    /// struct: the index build is O(N) because the format has no offset table.
+    pub fn open_url(url: &str) -> Result<Self> {
+        Self::from_source(Source::from_url(url)?)
+    }
+
+    pub(crate) fn from_source(src: Source) -> Result<Self> {
+        if src.len() < 16 || src.u32_at(0, true)? != MAGIC {
             return fmt_err("not a 4-bit file (bad magic)");
         }
-        let mut r = Reader::new(&data, true);
-        let _magic = r.u32()?;
-        let version = r.u32()?;
+        let version = src.u32_at(4, true)?;
         if version != VERSION {
             return fmt_err(format!("unsupported 4-bit version {version}"));
         }
-        let count = r.u32()? as usize;
-        let _reserved = r.u32()?;
+        let count = src.u32_at(8, true)? as usize;
+        // reserved u32 @12; records start at 16.
 
         let mut by_name = std::collections::HashMap::with_capacity(count);
         let mut order = Vec::with_capacity(count);
+        let mut pos = 16usize;
         for _ in 0..count {
-            let name_len = r.u8()? as usize;
-            let name = String::from_utf8_lossy(r.take(name_len)?).into_owned();
-            let len = r.u64()? as usize;
-            let packed_start = r.pos();
-            r.seek(packed_start + len.div_ceil(2)); // skip packed bytes
+            let name_len = src.u8_at(pos)? as usize;
+            let name = String::from_utf8_lossy(&src.bytes_at(pos + 1, name_len)?).into_owned();
+            let len = src.u64_at(pos + 1 + name_len, true)? as usize;
+            let packed_start = pos + 1 + name_len + 8;
             by_name.insert(name.clone(), (packed_start, len));
             order.push(name);
+            pos = packed_start + len.div_ceil(2); // skip packed bytes
         }
-        let _ = r;
-        Ok(FourBitReader { data, by_name, order })
+        Ok(FourBitReader { src, by_name, order })
+    }
+
+    /// `(requests, bytes)` issued so far over HTTP; `None` for local/in-memory.
+    pub fn http_stats(&self) -> Option<(u64, u64)> {
+        self.src.http_stats()
     }
 
     pub fn names(&self) -> &[String] {
@@ -166,13 +184,32 @@ impl FourBitReader {
             .ok_or_else(|| crate::error::Error::Format(format!("no sequence named {name:?}")))?;
         let end = end.unwrap_or(len).min(len);
         let start = start.min(end);
+        if start >= end {
+            return Ok(Vec::new());
+        }
+        // Read only the packed bytes spanning the window.
+        let first = start / 2;
+        let last = (end - 1) / 2;
+        let packed = self.src.bytes_at(packed_start + first, last - first + 1)?;
         let mut out = Vec::with_capacity(end - start);
         for i in start..end {
-            let byte = self.data[packed_start + i / 2];
+            let byte = packed[i / 2 - first];
             let nib = if i % 2 == 0 { byte >> 4 } else { byte & 0x0F };
             out.push(nibble_to_base(nib));
         }
         Ok(out)
+    }
+}
+
+impl crate::SeqReader for FourBitReader {
+    fn names(&self) -> Vec<String> {
+        self.order.clone()
+    }
+    fn extract(&self, name: &str, start: usize, end: Option<usize>) -> Result<Vec<u8>> {
+        FourBitReader::extract(self, name, start, end)
+    }
+    fn http_stats(&self) -> Option<(u64, u64)> {
+        self.src.http_stats()
     }
 }
 

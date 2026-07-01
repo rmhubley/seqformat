@@ -88,7 +88,7 @@ It also cross-checks correctness:
 ```sh
 bash bench/benchmark.sh                      # 3 x 100 Mbp (several minutes)
 SEQS=2 LEN=1000000 bash bench/benchmark.sh   # quick run
-COUNT=500000 bash bench/manyseq.sh           # 500k x 300 bp — sequence-count axis
+bash bench/manyseq.sh                        # 500k x 300 bp (default) — sequence-count axis
 ```
 
 Requires `faToTwoBit`, `twoBitToFa`, `gzip`, `bgzip`, `samtools` on `PATH`
@@ -228,6 +228,42 @@ reader stays fast in all three thanks to binary-searched lookup; `twoBitToFa`
 (linear per fragment) tracks the block count. For a realistic genome, isolated
 IUB codes are sparse (hundreds, not ~1.5 M), so the default's ~490 k blocks is a
 deliberately heavy case.
+
+### Serving over the web (HTTP range reads / UDC)
+
+Every reader can open an `http(s)://` URL and fetch only the bytes it needs via
+HTTP range requests — seqformat's analogue of UCSC's UDC layer (a shared
+`Source` in `src/source.rs`, a pooled `ureq` connection, an 8 KiB block cache).
+Just pass a URL where you'd pass a path:
+
+```sh
+seqformat extract https://host/genome.2be chr1:0-1000       # only header+index+window cross the wire
+seqformat extract https://host/genome.idx.2bit chr7 --http-stats   # print requests + bytes
+```
+
+This is where the **name-lookup index earns its keep remotely**, because over a
+network the cost is *round-trips and bytes*, not comparisons. Per single-sequence
+fetch on 500k × 300 bp (`bench/webseq.sh`, served from a real host):
+
+| format | index structure | ms/fetch | HTTP requests | bytes/fetch |
+|---|---|--:|--:|--:|
+| 2bit standard | flat, unsorted TOC | 217 | 3.9 | 6.7 MiB |
+| 2bit + index | sorted pointer array | 51 | 21.7 | 170 KiB |
+| **2be** | **on-disk B+ tree (fan-out 256)** | **16** | **7.0** | **49 KiB** |
+
+- **Standard 2bit** has no ordered in-file index, so resolving one name pulls the
+  **entire TOC** (O(N) bytes) — 6.7 MiB every open, bandwidth-bound.
+- **2bit + index** binary-searches its sorted array — O(log₂N), but the probes
+  scatter across the TOC (a pointer then a distant name), so ~22 small reads.
+- **2be**'s B+ tree packs keys per node, so a lookup touches ~3 nodes; it wins
+  both latency and bytes — the ideal remote shape.
+- **4bit** (no index) and **faidx** (whole `.fai` sidecar, or BGZF block scan)
+  are O(N) on open, matching their on-disk designs. faidx requires its `.fai`
+  sidecar to be served alongside the file.
+
+```sh
+bash bench/webseq.sh    # FORMATS="label=url ..." FETCHES=15 to customize
+```
 
 ## Format reference
 

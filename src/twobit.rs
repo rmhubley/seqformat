@@ -81,9 +81,8 @@ use crate::io::{peek_u32, peek_u64, put_u32, put_u64, put_u8, Reader};
 use crate::seq::{
     base_to_twobit, is_acgt, is_iub_degenerate, twobit_to_base, Sequence,
 };
-use std::cell::RefCell;
+use crate::source::Source;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 const SIGNATURE: u32 = 0x1A41_2743;
@@ -496,72 +495,6 @@ pub fn from_bytes(data: &[u8]) -> Result<TwoBitFile> {
 // Random-access reader (decode only the requested region)
 // ---------------------------------------------------------------------------
 
-/// Backing store for the random-access reader: either an in-memory buffer or a
-/// seekable file we `seek`+`read`. The file variant — which `open` uses — never
-/// loads the whole file: every access is a small positioned read of just the
-/// header, an index-probe path, or the requested window, matching how UCSC
-/// `twoBitToFa` (`lseek`+`read` via its UDC layer) touches only what it needs.
-enum Source {
-    Mem(Vec<u8>),
-    File { file: RefCell<fs::File>, len: usize },
-}
-
-impl Source {
-    fn len(&self) -> usize {
-        match self {
-            Source::Mem(d) => d.len(),
-            Source::File { len, .. } => *len,
-        }
-    }
-
-    /// Read exactly `buf.len()` bytes starting at `off`.
-    fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<()> {
-        match self {
-            Source::Mem(d) => {
-                let end = off
-                    .checked_add(buf.len())
-                    .filter(|&e| e <= d.len())
-                    .ok_or_else(|| crate::error::Error::Format(format!(
-                        "read of {} bytes at offset {off} is past the {}-byte buffer",
-                        buf.len(),
-                        d.len()
-                    )))?;
-                buf.copy_from_slice(&d[off..end]);
-                Ok(())
-            }
-            Source::File { file, .. } => {
-                let mut f = file.borrow_mut();
-                f.seek(SeekFrom::Start(off as u64))?;
-                f.read_exact(buf)?;
-                Ok(())
-            }
-        }
-    }
-
-    fn bytes_at(&self, off: usize, n: usize) -> Result<Vec<u8>> {
-        let mut v = vec![0u8; n];
-        self.read_at(off, &mut v)?;
-        Ok(v)
-    }
-
-    fn u8_at(&self, off: usize) -> Result<u8> {
-        let mut b = [0u8; 1];
-        self.read_at(off, &mut b)?;
-        Ok(b[0])
-    }
-
-    fn u32_at(&self, off: usize, little: bool) -> Result<u32> {
-        let mut b = [0u8; 4];
-        self.read_at(off, &mut b)?;
-        Ok(if little { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) })
-    }
-
-    fn u64_at(&self, off: usize, little: bool) -> Result<u64> {
-        let mut b = [0u8; 8];
-        self.read_at(off, &mut b)?;
-        Ok(if little { u64::from_le_bytes(b) } else { u64::from_be_bytes(b) })
-    }
-}
 
 /// The flat TOC parsed into a name→offset map. Built lazily, because a
 /// name-indexed file can answer single lookups by binary search without ever
@@ -592,16 +525,28 @@ impl TwoBitReader {
     /// Open by path using `seek`+`read`: only the header, an index probe, and
     /// the requested window are read — never the whole file.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let file = fs::File::open(path)?;
-        let len = file.metadata()?.len() as usize;
-        Self::from_source(Source::File { file: RefCell::new(file), len })
+        Self::from_source(Source::from_path(path)?)
     }
 
     pub fn from_vec(data: Vec<u8>) -> Result<Self> {
         Self::from_source(Source::Mem(data))
     }
 
-    fn from_source(src: Source) -> Result<Self> {
+    /// Open a remote `http(s)://` twoBit using HTTP range requests (UDC-style):
+    /// only the header, index probes, and the requested window cross the wire —
+    /// never the whole file. Adjacent reads coalesce through an 8 KiB block
+    /// cache. See [`TwoBitReader::http_stats`] for the request/byte tally.
+    pub fn open_url(url: &str) -> Result<Self> {
+        Self::from_source(Source::from_url(url)?)
+    }
+
+    /// `(requests, bytes)` issued so far when reading over HTTP; `None` for
+    /// local/in-memory sources.
+    pub fn http_stats(&self) -> Option<(u64, u64)> {
+        self.src.http_stats()
+    }
+
+    pub(crate) fn from_source(src: Source) -> Result<Self> {
         if src.len() < 16 {
             return fmt_err("file too small to be a twoBit");
         }
@@ -807,6 +752,18 @@ impl TwoBitReader {
             |_, lo, hi| seq[lo..hi].make_ascii_lowercase(),
         );
         Ok(seq)
+    }
+}
+
+impl crate::SeqReader for TwoBitReader {
+    fn names(&self) -> Vec<String> {
+        self.names().to_vec()
+    }
+    fn extract(&self, name: &str, start: usize, end: Option<usize>) -> Result<Vec<u8>> {
+        TwoBitReader::extract(self, name, start, end)
+    }
+    fn http_stats(&self) -> Option<(u64, u64)> {
+        self.http_stats()
     }
 }
 

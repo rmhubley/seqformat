@@ -11,13 +11,13 @@
 #      tree pays O(log N))
 #
 # Config via env (defaults shown):
-#   COUNT=200000 LEN=300 NFRAC=0.01 IUBFRAC=0.005 SEED=1
+#   COUNT=500000 LEN=300 NFRAC=0.01 IUBFRAC=0.005 SEED=1
 #   BULK=20000   FETCHES=300   ENC_ITERS=2
 #   WORKDIR=./bench/manywork  BIN=./target/release/seqformat
 
 set -euo pipefail
 
-COUNT=${COUNT:-200000}
+COUNT=${COUNT:-500000}
 LEN=${LEN:-300}
 NFRAC=${NFRAC:-0.01}
 IUBFRAC=${IUBFRAC:-0.005}

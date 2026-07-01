@@ -17,6 +17,7 @@ pub mod error;
 pub mod io;
 pub mod seq;
 pub mod fasta;
+pub(crate) mod source;
 pub mod twobit;
 pub mod fourbit;
 pub mod samtools;
@@ -26,3 +27,33 @@ pub mod generate;
 
 pub use error::{Error, Result};
 pub use seq::Sequence;
+
+/// A uniform random-access view over any supported container, used by the URL
+/// path so callers don't dispatch on format themselves.
+pub trait SeqReader {
+    /// Sequence names in file order.
+    fn names(&self) -> Vec<String>;
+    /// Decode `[start, end)` of `name` (0-based, half-open; `end == None` = to end).
+    fn extract(&self, name: &str, start: usize, end: Option<usize>) -> Result<Vec<u8>>;
+    /// `(requests, bytes)` if reading over HTTP; `None` otherwise.
+    fn http_stats(&self) -> Option<(u64, u64)>;
+}
+
+/// Open any supported container served over `http(s)://` for UDC-style range
+/// reads, auto-detecting the format from a small prefix. One [`source::Source`]
+/// is built, peeked, then handed to the matching reader (no re-probe).
+pub fn open_url(url: &str) -> Result<Box<dyn SeqReader>> {
+    let src = source::Source::from_url(url)?;
+    let prefix = src.bytes_at(0, src.len().min(64))?;
+    if twobit::is_twobit(&prefix) {
+        Ok(Box::new(twobit::TwoBitReader::from_source(src)?))
+    } else if twobyte::is_twobyte(&prefix) {
+        Ok(Box::new(twobyte::TwoByteReader::from_source(src)?))
+    } else if fourbit::is_fourbit(&prefix) {
+        Ok(Box::new(fourbit::FourBitReader::from_source(src)?))
+    } else if samtools::is_bgzf(&prefix) || samtools::is_fasta(&prefix) {
+        Ok(Box::new(samtools::FaidxReader::from_source(src)?))
+    } else {
+        Err(Error::Format(format!("{url}: unrecognized sequence format")))
+    }
+}

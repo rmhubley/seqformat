@@ -18,6 +18,7 @@
 
 use crate::error::{fmt_err, Error, Result};
 use crate::seq::Sequence;
+use crate::source::Source;
 use libdeflater::{CompressionLvl, Compressor, Crc, Decompressor};
 use std::collections::HashMap;
 use std::fs;
@@ -246,9 +247,10 @@ pub fn is_fasta(d: &[u8]) -> bool {
     d.first() == Some(&b'>')
 }
 
-/// Random-access reader over a samtools-style indexed FASTA (plain or BGZF).
+/// Random-access reader over a samtools-style indexed FASTA (plain or BGZF),
+/// backed by a [`Source`] (local file, memory, or remote HTTP).
 pub struct FaidxReader {
-    data: Vec<u8>,
+    src: Source,
     bgzf_blocks: Option<Vec<Block>>, // None => plain FASTA
     by_name: HashMap<String, FaiRec>,
     order: Vec<String>,
@@ -257,30 +259,55 @@ pub struct FaidxReader {
 impl FaidxReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let data = fs::read(path)?;
-        let bgzf_blocks = if is_bgzf(&data) {
-            Some(scan_bgzf(&data)?)
-        } else if is_fasta(&data) {
-            None
-        } else {
-            return fmt_err("not a FASTA or BGZF file");
-        };
+        let src = Source::from_path(path)?;
+        let bgzf_blocks = detect_bgzf(&src)?;
 
         // Prefer the sidecar .fai; otherwise build one by scanning.
         let fai_path = sidecar(path, ".fai");
         let recs = if fai_path.exists() {
             parse_fai(&fs::read_to_string(fai_path)?)?
         } else {
-            build_fai_by_scan(&data, &bgzf_blocks)?
+            build_fai_by_scan_src(&src, &bgzf_blocks)?
         };
+        Ok(Self::assemble(src, bgzf_blocks, recs))
+    }
 
+    /// Open a remote `http(s)://` indexed FASTA over HTTP range reads. The
+    /// sidecar `.fai` (`<url>.fai`) is **required** remotely — the whole-file
+    /// scan fallback would defeat range access. For plain FASTA a lookup is a
+    /// single range read of the window; for BGZF the block headers are scanned
+    /// (O(blocks)) and only the covering block(s) are fetched + inflated.
+    pub fn open_url(url: &str) -> Result<Self> {
+        Self::from_source(Source::from_url(url)?)
+    }
+
+    pub(crate) fn from_source(src: Source) -> Result<Self> {
+        let bgzf_blocks = detect_bgzf(&src)?;
+        let recs = match src.url() {
+            Some(u) => {
+                let fai = Source::from_url(&format!("{u}.fai"))
+                    .map_err(|e| Error::Format(format!("{u}.fai (required for remote faidx): {e}")))?;
+                let text = fai.bytes_at(0, fai.len())?;
+                parse_fai(&String::from_utf8_lossy(&text))?
+            }
+            None => build_fai_by_scan_src(&src, &bgzf_blocks)?,
+        };
+        Ok(Self::assemble(src, bgzf_blocks, recs))
+    }
+
+    fn assemble(src: Source, bgzf_blocks: Option<Vec<Block>>, recs: Vec<FaiRec>) -> Self {
         let mut by_name = HashMap::with_capacity(recs.len());
         let mut order = Vec::with_capacity(recs.len());
         for r in recs {
             order.push(r.name.clone());
             by_name.insert(r.name.clone(), r);
         }
-        Ok(FaidxReader { data, bgzf_blocks, by_name, order })
+        FaidxReader { src, bgzf_blocks, by_name, order }
+    }
+
+    /// `(requests, bytes)` issued so far over HTTP; `None` for local/in-memory.
+    pub fn http_stats(&self) -> Option<(u64, u64)> {
+        self.src.http_stats()
     }
 
     pub fn names(&self) -> &[String] {
@@ -300,15 +327,23 @@ impl FaidxReader {
             return Ok(Vec::new());
         }
         match &self.bgzf_blocks {
-            None => Ok(self.data[a..b.min(self.data.len())].to_vec()),
+            None => {
+                let hi = b.min(self.src.len());
+                if a >= hi {
+                    return Ok(Vec::new());
+                }
+                self.src.bytes_at(a, hi - a)
+            }
             Some(blocks) => {
                 let mut out = Vec::with_capacity(b - a);
                 // First block whose end is past `a`.
                 let mut i = blocks.partition_point(|blk| blk.u_start + blk.u_len <= a);
                 while i < blocks.len() && blocks[i].u_start < b {
                     let blk = &blocks[i];
-                    let cdata = &self.data[blk.c_start + 18..blk.c_start + blk.c_len - 8];
-                    let u = inflate_raw(cdata, blk.u_len)?;
+                    // Compressed deflate stream sits between the 18-byte header
+                    // and the 8-byte CRC+ISIZE trailer.
+                    let cdata = self.src.bytes_at(blk.c_start + 18, blk.c_len - 26)?;
+                    let u = inflate_raw(&cdata, blk.u_len)?;
                     let lo = a.max(blk.u_start) - blk.u_start;
                     let hi = b.min(blk.u_start + blk.u_len) - blk.u_start;
                     out.extend_from_slice(&u[lo..hi]);
@@ -341,25 +376,49 @@ impl FaidxReader {
     }
 }
 
-fn scan_bgzf(data: &[u8]) -> Result<Vec<Block>> {
+impl crate::SeqReader for FaidxReader {
+    fn names(&self) -> Vec<String> {
+        self.order.clone()
+    }
+    fn extract(&self, name: &str, start: usize, end: Option<usize>) -> Result<Vec<u8>> {
+        FaidxReader::extract(self, name, start, end)
+    }
+    fn http_stats(&self) -> Option<(u64, u64)> {
+        self.src.http_stats()
+    }
+}
+
+/// Peek the prefix to classify the source, returning the BGZF block map (by
+/// scanning self-describing block headers) for a BGZF file, `None` for plain
+/// FASTA, or an error otherwise.
+fn detect_bgzf(src: &Source) -> Result<Option<Vec<Block>>> {
+    let head = src.bytes_at(0, src.len().min(18))?;
+    if is_bgzf(&head) {
+        Ok(Some(scan_bgzf_src(src)?))
+    } else if is_fasta(&head) {
+        Ok(None)
+    } else {
+        fmt_err("not a FASTA or BGZF file")
+    }
+}
+
+/// Scan BGZF block headers over a [`Source`]. Reads only each block's 18-byte
+/// header + 4-byte ISIZE — O(blocks) positioned reads, never the payloads.
+fn scan_bgzf_src(src: &Source) -> Result<Vec<Block>> {
     let mut blocks = Vec::new();
-    let mut c = 0usize;
-    let mut u = 0usize;
-    while c + 18 <= data.len() {
-        if !(data[c] == 0x1f && data[c + 1] == 0x8b) {
+    let (mut c, mut u) = (0usize, 0usize);
+    let total = src.len();
+    while c + 18 <= total {
+        let hdr = src.bytes_at(c, 18)?;
+        if !(hdr[0] == 0x1f && hdr[1] == 0x8b) {
             break;
         }
-        let bsize = u16::from_le_bytes([data[c + 16], data[c + 17]]) as usize;
+        let bsize = u16::from_le_bytes([hdr[16], hdr[17]]) as usize;
         let blen = bsize + 1;
-        if c + blen > data.len() {
+        if c + blen > total {
             return fmt_err("truncated BGZF block");
         }
-        let isize = u32::from_le_bytes([
-            data[c + blen - 4],
-            data[c + blen - 3],
-            data[c + blen - 2],
-            data[c + blen - 1],
-        ]) as usize;
+        let isize = src.u32_at(c + blen - 4, true)? as usize;
         if isize == 0 {
             break; // EOF marker / empty block
         }
@@ -368,6 +427,14 @@ fn scan_bgzf(data: &[u8]) -> Result<Vec<Block>> {
         u += isize;
     }
     Ok(blocks)
+}
+
+/// Whole-file fallback (no `.fai`): slurp via the source and scan the FASTA to
+/// reconstruct the index. Reads the entire file, so it is only used for local
+/// inputs; the remote path requires a `.fai` sidecar instead.
+fn build_fai_by_scan_src(src: &Source, bgzf_blocks: &Option<Vec<Block>>) -> Result<Vec<FaiRec>> {
+    let data = src.bytes_at(0, src.len())?;
+    build_fai_by_scan(&data, bgzf_blocks)
 }
 
 /// Fallback when no `.fai` sidecar exists: decompress (if needed) and scan the

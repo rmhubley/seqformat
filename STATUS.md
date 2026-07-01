@@ -41,6 +41,10 @@ ambiguity), `info`.
   scattered `IUB_RUNS=0`). Reports size/bits-base, encode, bulk-extract,
   per-fetch latency.
 - `manyseq.sh` — many short seqs (default 500k×300 bp). Same metrics.
+- `webseq.sh` — **remote** per-fetch over HTTP range requests (the UDC case).
+  Fetches single seqs from files served by URL and reports ms/fetch + HTTP
+  requests + bytes/fetch. Configurable `FORMATS="label=url ..."`; defaults to
+  the 500k `2bit std` / `2bit idx` / `2be` comparison.
 - Both report the same columns/labels (`2bit (UCSC kentsrc)`, `BGZF (samtools)`,
   etc.); latest numbers + analysis are in README.
 
@@ -61,12 +65,38 @@ ambiguity), `info`.
   match ~1 ms with the same reader), `twoBitToFa` 89 ms, samtools 241 ms. It's the
   only format winning both axes: O(log N) lookup *and* seek. README tables
   refreshed 2026-06-29 with all of this.
+- **Remote/UDC (new)**: a shared `Source` (`src/source.rs`; Mem/File/Http) gives
+  **every** reader an HTTP range-read path — `ureq` agent with a pooled
+  connection + UDC-style 8 KiB block cache. `seqformat::open_url()` auto-detects
+  format and returns a `Box<dyn SeqReader>`; `extract <url> --http-stats` reports
+  requests/bytes. Web per-fetch on 500k×300 (served from repeatmasker.org):
+
+  | format | ms/fetch | req/fetch | KiB/fetch |
+  |---|--:|--:|--:|
+  | 2bit std (flat TOC)     | 217 | 3.9  | 6743 |
+  | 2bit idx (sorted array) |  51 | 21.7 |  170 |
+  | **2be (B+ tree)**       | **16** | **7.0** | **49** |
+
+  The story from the theory holds: flat TOC pulls O(N) bytes (whole TOC) every
+  open; the sorted index does ~log₂N *scattered* probes (poor locality — a
+  block-size sweep leaves it at ~15–25 requests); the **2be on-disk B+ tree
+  (fan-out 256, `bptree::find_src`) hits the ideal ~3-node lookup**, so it wins
+  both latency and bytes. 4bit (no index) is O(N) on open — ~10k req / 84 MiB, it
+  scans every interleaved record header. faidx loads the whole `.fai` sidecar
+  (O(N)) then does a single window read (plain) or scans BGZF block headers
+  (O(blocks)). Benchmarked by `bench/webseq.sh`.
 
 ## Known limitations / candidate next steps
-- **2bit reader now seeks** (done). Remaining slurpers: `4bit`, `2be`, and the
-  samtools/BGZF reader still `read()` the whole file on open → 46–241 ms
-  single-fetch. Same `Source`/seek treatment would fix each (2be especially —
-  would drop ~37 ms → ~1 ms).
+- **All readers are now Source-backed (seek + HTTP range reads)** — `twobit`,
+  `twobyte` (2be), `fourbit`, and `samtools`/BGZF share `src/source.rs`. The old
+  whole-file slurp on open is gone; local single-fetch is seek-based and remote
+  is range-based. 2be's local per-fetch should now match ~1 ms (was ~37 ms when
+  it slurped) — worth re-running `manyseq.sh` to refresh those numbers.
+- HTTP `Source` adds a `ureq` (rustls) dependency; could be gated behind an
+  optional `http` cargo feature to keep the default build std-only + libdeflater.
+  Remote is `http(s)` only (no `ftp`/`s3`). faidx requires a `.fai` sidecar
+  remotely (the scan fallback would defeat range access); remote BGZF scans block
+  headers (O(blocks)) rather than reading a `.gzi`.
 - Flat-TOC (non-indexed) 2bit still builds a `String` HashMap of all names when a
   name is looked up without the index → 164 ms on 500k seqs. The `--index` format
   removes it; plain 2bit could also lazily binary-search a seek-read TOC.

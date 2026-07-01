@@ -281,7 +281,7 @@ fn region_name(name: &str, start: usize, end: Option<usize>) -> String {
 }
 
 fn cmd_extract(args: &[String]) -> Result<()> {
-    let o = parse(args, &[], &["out", "width", "seq-list"])?;
+    let o = parse(args, &["http-stats"], &["out", "width", "seq-list"])?;
     let file = o
         .pos
         .first()
@@ -320,6 +320,30 @@ fn cmd_extract(args: &[String]) -> Result<()> {
         }};
     }
 
+    // A remote http(s) input is opened over HTTP range requests (UDC-style),
+    // never slurped. Format is auto-detected from a small prefix. This is the
+    // web-serving path the webseq benchmark exercises.
+    if file.starts_with("http://") || file.starts_with("https://") {
+        let rd = seqformat::open_url(file)?;
+        if regions.is_empty() {
+            regions = rd.names().iter().map(|n| (n.clone(), 0, None)).collect();
+        }
+        let out_seqs: Vec<seqformat::Sequence> = regions
+            .iter()
+            .map(|(n, s, e)| {
+                rd.extract(n, *s, *e)
+                    .map(|b| seqformat::Sequence::new(region_name(n, *s, *e), b))
+            })
+            .collect::<Result<_>>()?;
+        if o.flags.contains("http-stats") {
+            if let Some((reqs, bytes)) = rd.http_stats() {
+                eprintln!("http: {reqs} requests, {bytes} bytes");
+            }
+        }
+        write_extract_output(o.vals.get("out"), &out_seqs, width)?;
+        return Ok(());
+    }
+
     // Peek only a small prefix for format detection so a 2bit file isn't slurped
     // into memory just to fetch one region — the 2bit reader then opens it with
     // seek+read. Other formats keep their existing whole-file path.
@@ -346,11 +370,20 @@ fn cmd_extract(args: &[String]) -> Result<()> {
         }
     };
 
-    match o.vals.get("out") {
-        Some(path) => fasta::write_file(path, &out_seqs, width)?,
+    write_extract_output(o.vals.get("out"), &out_seqs, width)
+}
+
+/// Write extracted sequences to `--out` (FASTA file) or stdout.
+fn write_extract_output(
+    out: Option<&String>,
+    seqs: &[seqformat::Sequence],
+    width: usize,
+) -> Result<()> {
+    match out {
+        Some(path) => fasta::write_file(path, seqs, width)?,
         None => {
             use std::io::Write;
-            let bytes = fasta::write_bytes(&out_seqs, width);
+            let bytes = fasta::write_bytes(seqs, width);
             std::io::stdout().write_all(&bytes)?;
         }
     }
