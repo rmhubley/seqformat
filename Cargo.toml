@@ -9,6 +9,7 @@ description = "Read/write UCSC twoBit (standard + long + IUB extension) and BWA-
 # library that htslib itself uses). This needs a C compiler at build time.
 [dependencies]
 libdeflater = "1"
+ureq = "2"
 
 [[bin]]
 name = "seqformat"

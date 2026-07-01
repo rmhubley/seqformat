@@ -88,7 +88,7 @@ It also cross-checks correctness:
 ```sh
 bash bench/benchmark.sh                      # 3 x 100 Mbp (several minutes)
 SEQS=2 LEN=1000000 bash bench/benchmark.sh   # quick run
-COUNT=500000 bash bench/manyseq.sh           # 500k x 300 bp — sequence-count axis
+bash bench/manyseq.sh                        # 500k x 300 bp (default) — sequence-count axis
 ```
 
 Requires `faToTwoBit`, `twoBitToFa`, `gzip`, `bgzip`, `samtools` on `PATH`
@@ -103,14 +103,14 @@ an N-block, the scattered IUB dominate the N-block table (~490 k blocks/seq).
 | format | size | bits/base | encode (median) | bulk 20k (1 proc) | per-fetch (separate procs) |
 |---|---:|---:|---:|---:|---:|
 | FASTA (raw) | 290.9 MiB | 8.133 | — | — | — |
-| 2bit (UCSC kentsrc) | 82.8 MiB | 2.315 | 2.56 s | 17.5 s ¹ | 8.2 ms/fetch |
-| BGZF (samtools) | 90.8 MiB | 2.538 | 9.93 s | 5.93 s | 5.4 ms/fetch |
-| BGZF (seqformat) | 90.8 MiB | 2.538 | 8.70 s ² | 2.35 s | 95.3 ms/fetch ³ |
-| **2bit (seqformat)** | **82.8 MiB** | **2.315** | 2.42 s | **0.120 s** | **1.1 ms/fetch** ⁵ |
-| 2bit+IUB (seqformat) | 95.6 MiB | 2.672 | 3.79 s | 0.136 s | **1.1 ms/fetch** ⁵ |
-| 2bit+IUB+index (seqformat) | 95.6 MiB ⁴ | 2.672 | 3.80 s | 0.136 s | **1.2 ms/fetch** ⁵ |
-| 4bit (seqformat) | 143.1 MiB | 4.000 | 1.64 s | 0.121 s | 76.5 ms/fetch ³ |
-| 2be (seqformat) | 85.7 MiB | 2.396 | 2.61 s | 0.134 s | 46.0 ms/fetch ³ |
+| 2bit (UCSC kentsrc) | 82.8 MiB | 2.315 | 2.54 s | 19.7 s ¹ | 8.8 ms/fetch |
+| BGZF (samtools) | 90.8 MiB | 2.538 | 9.96 s | 5.93 s | 5.5 ms/fetch |
+| BGZF (seqformat) | 90.8 MiB | 2.538 | 8.72 s ² | 2.33 s | 7.9 ms/fetch ⁵ |
+| **2bit (seqformat)** | **82.8 MiB** | **2.315** | 2.39 s | **0.117 s** | **1.3 ms/fetch** ⁵ |
+| 2bit+IUB (seqformat) | 95.6 MiB | 2.672 | 3.52 s | 0.136 s | **1.3 ms/fetch** ⁵ |
+| 2bit+IUB+index (seqformat) | 95.6 MiB ⁴ | 2.672 | 3.53 s | 0.141 s | **1.3 ms/fetch** ⁵ |
+| 4bit (seqformat) | 143.1 MiB | 4.000 | 1.57 s | 0.134 s | 81.1 ms/fetch ³ |
+| 2be (seqformat) | 85.7 MiB | 2.396 | 2.60 s | 0.512 s | **1.9 ms/fetch** ⁵ |
 
 Notes:
 - Even with ~490 k IUB N-blocks per sequence, **standard 2bit is still the
@@ -118,32 +118,33 @@ Notes:
   gaps are clustered and the bases pack at 2 bits.
 - ¹ `2bit (UCSC kentsrc)` = the `faToTwoBit`/`twoBitToFa` tools. In **bulk**,
   `twoBitToFa` reads the full block list per fragment, so the ~490 k scattered IUB
-  blocks slow it to ~0.87 ms/region (17.5 s for 20 k); our binary-searched reader
-  stays at **0.120 s (~146× faster)**. Clustering IUB too (`IUB_RUNS=3`) or a
+  blocks slow it to ~1 ms/region (19.7 s for 20 k); our binary-searched reader
+  stays at **0.117 s (~170× faster)**. Clustering IUB too (`IUB_RUNS=3`) or a
   realistic sparse IUB rate collapses this to ~6 blocks/seq and `twoBitToFa`
   becomes sub-second.
-- ³ **These three still `read()` the whole file on open.** The `4bit`, `2be`, and
-  `BGZF (seqformat)` readers load the entire file into memory, so a single fetch
-  from an 85–143 MB file costs 46–95 ms. Only the **2bit-family reader** was
-  converted to seek+read (note ⁵); giving the others the same treatment would
-  close their gap too.
+- ³ **4bit is the only slurper left, by design.** It carries no offset table, so
+  a lookup must touch every record header — one sequential whole-file read beats
+  O(N) scattered seeks, so the reader slurps 143 MB (81 ms single-fetch). Every
+  other seqformat reader now seeks (note ⁵).
 - ⁴ The sorted-name index costs **8 bytes/sequence** + a 24-byte footer, so on
   just 3 sequences it adds 40 bytes — size is unchanged to two decimals. With so
   few sequences there is no O(N) index load to skip, so it neither helps nor
   hurts per-fetch here; its payoff appears in the many-short-sequence table below.
-- ⁵ **The 2bit-family reader uses `seek`+`read`** (like `twoBitToFa`'s
-  `lseek`/`read`): a single fetch reads only the 16-byte header, the index probe
-  path, and the requested window — never the whole file. That dropped per-fetch
-  from ~45–53 ms (the old whole-file slurp) to **~1.1 ms**, now *faster* than
-  `twoBitToFa` itself (8.2 ms — our process startup is lighter). Bulk extraction
-  amortizes a single whole-file read instead, so it stays at ~0.12 s.
+- ⁵ **All readers are now `Source`-backed `seek`+`read`** (like `twoBitToFa`'s
+  `lseek`/`read`; `src/source.rs`): a single fetch reads only the header, the
+  index probe path, and the requested window — never the whole file. This is the
+  change that dropped `BGZF (seqformat)` from **95 → 7.9 ms** and `2be` from
+  **46 → 1.9 ms** (both used to slurp); the 2bit family sits at ~1.3 ms, faster
+  than `twoBitToFa` itself (8.8 ms — our process startup is lighter). Bulk
+  extraction (>1024 regions) amortizes a single whole-file read instead. The same
+  `Source` also does HTTP range reads — see "Serving over the web" below.
 - Everything cross-validates: our standard 2bit is **byte-identical** to
   `faToTwoBit`'s, our BGZF + `.fai`/`.gzi` are **byte-identical** to `bgzip`/
   `samtools`', and `samtools faidx` agrees with our 2bit+IUB / 4bit / BGZF / 2be
   decode.
 - ² `BGZF (seqformat)` uses `libdeflate` (the same codec as htslib `bgzip`), so
   output is **byte-identical to `bgzip`**; encode matches (~9 s) and bulk
-  extraction beats `samtools faidx` (2.37 s vs 5.92 s).
+  extraction beats `samtools faidx` (2.33 s vs 5.93 s).
 
 ### Many short sequences — the sequence-count axis (`bench/manyseq.sh`)
 
@@ -160,49 +161,50 @@ between the two tables.
 | format | size | bits/base | build (median) | bulk 20k (1 proc) | **per-fetch (separate procs)** |
 |---|---:|---:|---:|---:|---:|
 | FASTA (raw) | 150.6 MiB | 8.421 | — | — | — |
-| 2bit (UCSC kentsrc) | 59.4 MiB | 3.320 | 1.70 s | 0.152 s | 89.5 ms/fetch |
-| BGZF (samtools) | 49.2 MiB | 2.754 | 5.61 s | 0.975 s | 240.8 ms/fetch ³ |
-| 2bit (seqformat, flat TOC) | 59.4 MiB | 3.320 | 1.62 s | 0.275 s | 164.0 ms/fetch ⁶ |
-| **2bit+IUB+index (seqformat, ptr array)** | 71.5 MiB | 3.997 | 2.52 s | **0.110 s** | **1.4 ms/fetch** ⁵ |
-| 4bit (seqformat, no index) | 80.0 MiB | 4.474 | 1.08 s | 0.287 s | 219.3 ms/fetch ³ |
-| 2be (seqformat, B+ tree) | 63.4 MiB | 3.545 | 1.85 s | **0.090 s** | 37.1 ms/fetch ³ |
+| 2bit (UCSC kentsrc) | 59.4 MiB | 3.320 | 1.69 s | 0.151 s | 89.2 ms/fetch |
+| BGZF (samtools) | 49.2 MiB | 2.754 | 5.43 s | 0.975 s | 244.8 ms/fetch ³ |
+| 2bit (seqformat, flat TOC) | 59.4 MiB | 3.320 | 1.60 s | 0.276 s | 173.1 ms/fetch ⁶ |
+| **2bit+IUB+index (seqformat, ptr array)** | 71.5 MiB | 3.997 | 2.42 s | **0.107 s** | **1.4 ms/fetch** ⁵ |
+| 4bit (seqformat, no index) | 80.0 MiB | 4.474 | 0.94 s | 0.314 s | 244.6 ms/fetch ³ |
+| **2be (seqformat, B+ tree)** | 63.4 MiB | 3.545 | 1.72 s | **0.104 s** | **1.4 ms/fetch** ⁵ |
 
 The per-fetch column (open + fetch one sequence in a *separate* process — the
-real "grab a contig from a huge multi-FASTA" pattern) is the headline, and
-**2bit+IUB+index lands at 1.4 ms** — ~120× faster than our own flat-TOC 2bit
-reader, ~64× faster than `twoBitToFa`, and ~170× faster than `samtools faidx`.
-It is the only format here that wins on *both* axes at once: the sorted pointer
-array makes the name lookup O(log N) (no 500k-entry TOC to load), and the
-seek+read reader (note ⁵) means the lookup probes and the one record are the only
-bytes touched. Every other reader pays at least one O(N) cost per call —
-flat-index formats rebuild the whole 500k-entry TOC (164 ms ⁶), 4bit scans all
-500k records (219 ms), `twoBitToFa` loads its index into a hash (89 ms), and the
-slurp-based readers also read the whole file.
+real "grab a contig from a huge multi-FASTA" pattern) is the headline, and the
+two indexed formats **tie at 1.4 ms** — the sorted pointer array and the 2be B+
+tree both make the name lookup O(log N) (no 500k-entry TOC to load), and the
+`Source` seek+read reader (note ⁵) means the lookup probes and the one record are
+the only bytes touched. That's ~120× faster than our own flat-TOC 2bit reader,
+~64× faster than `twoBitToFa`, and ~175× faster than `samtools faidx`. Every
+non-indexed reader pays an O(N) cost per call — the flat-TOC 2bit rebuilds the
+whole 500k-entry TOC (173 ms ⁶), 4bit scans all 500k interleaved record headers
+(245 ms), `twoBitToFa` loads its index into a hash (89 ms), and `samtools faidx`
+loads its `.fai` (245 ms).
 
-Two honest caveats on the comparison:
+Two notes on the comparison:
 
-- **2be (37 ms) is hobbled by its reader, not its format.** The 2be prototype
-  reader still slurps the whole 63 MB file on open (only the 2bit-family reader
-  was converted to seek+read). Its B+ tree is every bit as O(log N) as the
-  pointer array; given the same seek treatment it would also land near ~1 ms. So
-  read the 1.4 ms vs 37 ms as *reader maturity*, not a format verdict.
+- **2be now matches the pointer array locally (both 1.4 ms).** Earlier 2be sat at
+  37 ms because its reader slurped the whole file; now that every reader is
+  `Source`-backed, its B+ tree delivers the O(log N) lookup its design promised.
+  Locally the two are a wash; the B+ tree's edge shows up **remotely**, where
+  round-trips dominate — see "Serving over the web" above (2be resolves a name in
+  ~3 node reads vs the pointer array's ~20 scattered probes).
 - **The index's payoff is the lookup, not the bytes.** 2bit+IUB+index is the
   largest format here (71.5 MiB) — but that bulk is the *IUB* tables (standard
   twoBit records every scattered degenerate as an 8-byte N-block, which 2be's
   merged stream avoids), not the index. The pointer array itself is only ~3.8 MiB;
   dropping `--iub` (index only) brings the file back near plain 2bit.
 
-The takeaway: a flat sorted pointer array — 8 bytes/sequence, fully twoBit
-backward compatible — plus a seek+read reader matches everything 2be's
-incompatible B+ tree set out to do for exact-name lookup.
+The takeaway: for the **local** exact-name lookup, a flat sorted pointer array —
+8 bytes/sequence, fully twoBit backward compatible — matches 2be's incompatible
+B+ tree. Over the **web**, the B+ tree's higher fan-out pulls ahead on round-trips.
 
 > ⁶ The flat-TOC 2bit reader is seek-based too (note ⁵), so it no longer reads the
 > whole 59 MB file — but with no name index it must still load the entire 500k-entry
-> TOC to resolve one name, and that O(N) load is the 164 ms (provable here: the
+> TOC to resolve one name, and that O(N) load is the 173 ms (provable here: the
 > *indexed* reader is the same reader minus this step and runs in 1.4 ms).
 > `twoBitToFa` pays the **same** O(N) load — kent's `twoBitOpen` also reads the whole
 > index into a name hash on open — so it too is in this slow regime at 89 ms, ~64×
-> the indexed reader. It's ~1.8× faster than *our* flat reader only by constant
+> the indexed reader. It's ~1.9× faster than *our* flat reader only by constant
 > factor: our `flat()` heap-allocates each name twice (the map key plus the `order`
 > vec) and uses Rust's SipHash, where kent keeps each name once in a `localmem`
 > arena with a lighter hash. The name index removes the load entirely; it does not
@@ -219,7 +221,7 @@ runs (assembly gaps). But scattered ambiguity yields one length-1 block each, at
 | config | N-blocks / 100 Mbp seq | 2bit standard | `twoBitToFa` 20k extract |
 |---|---|---|---|
 | N + IUB scattered (`0 / 0`) | ~1.5 M | 2.945 b/base (105 MiB) | 60–100 s |
-| N clustered, IUB scattered (`3 / 0`, default) | ~490 k | 2.315 b/base (83 MiB) | 17 s |
+| N clustered, IUB scattered (`3 / 0`, default) | ~490 k | 2.315 b/base (83 MiB) | ~20 s |
 | N + IUB clustered (`3 / 3`) | 6 | 2.000 b/base (75 MiB) | sub-second |
 
 Key point: because standard twoBit lumps `N` and every IUB code into one block
@@ -228,6 +230,48 @@ reader stays fast in all three thanks to binary-searched lookup; `twoBitToFa`
 (linear per fragment) tracks the block count. For a realistic genome, isolated
 IUB codes are sparse (hundreds, not ~1.5 M), so the default's ~490 k blocks is a
 deliberately heavy case.
+
+### Serving over the web (HTTP range reads / UDC)
+
+Every reader can open an `http(s)://` URL and fetch only the bytes it needs via
+HTTP range requests — seqformat's analogue of UCSC's UDC layer (a shared
+`Source` in `src/source.rs`, a pooled `ureq` connection, an 8 KiB block cache).
+Just pass a URL where you'd pass a path:
+
+```sh
+seqformat extract https://host/genome.2be chr1:0-1000       # only header+index+window cross the wire
+seqformat extract https://host/genome.idx.2bit chr7 --http-stats   # print requests + bytes
+```
+
+This is where the **name-lookup index earns its keep remotely**, because over a
+network the cost is *round-trips and bytes*, not comparisons. Per single-sequence
+fetch on 500k × 300 bp (`bench/webseq.sh`, served from a real host; `ms/fetch`
+varies with the network, but `requests` and `bytes` are architecture-determined
+and stable):
+
+| format | index structure | ms/fetch | HTTP requests | bytes/fetch |
+|---|---|--:|--:|--:|
+| 2bit standard | flat, unsorted TOC | 240 | 3.9 | 6.7 MiB |
+| 2bit + index | sorted pointer array | 82 | 21.7 | 170 KiB |
+| **2be** | **on-disk B+ tree (fan-out 256)** | **22** | **7.0** | **49 KiB** |
+
+- **Standard 2bit** has no ordered in-file index, so resolving one name pulls the
+  **entire TOC** (O(N) bytes) — 6.7 MiB every open, bandwidth-bound.
+- **2bit + index** binary-searches its sorted array — O(log₂N), but the probes
+  scatter across the TOC (a pointer then a distant name), so ~22 small reads.
+- **2be**'s B+ tree packs keys per node, so a lookup touches ~3 nodes; it wins
+  both latency and bytes — the ideal remote shape, and the same ~1.4 ms locally.
+- **4bit and faidx are O(N) on open, by design.** 4bit has no index, so a lookup
+  scans every interleaved record header — ~10.2k requests / 84 MiB (essentially
+  the whole file). faidx must first pull its entire `.fai` sidecar (the index):
+  ~1.37 MiB for a plain 50k-seq FASTA (the `.fai` load dominates the window read),
+  and BGZF adds an O(blocks) header scan. `--http-stats` folds the `.fai` fetch
+  into the reported total, so faidx isn't flattered by hiding its index load. A
+  remote faidx therefore needs its `.fai` served alongside the file.
+
+```sh
+bash bench/webseq.sh    # FORMATS="label=url ..." FETCHES=15 to customize
+```
 
 ## Format reference
 

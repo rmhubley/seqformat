@@ -281,7 +281,7 @@ fn region_name(name: &str, start: usize, end: Option<usize>) -> String {
 }
 
 fn cmd_extract(args: &[String]) -> Result<()> {
-    let o = parse(args, &[], &["out", "width", "seq-list"])?;
+    let o = parse(args, &["http-stats"], &["out", "width", "seq-list"])?;
     let file = o
         .pos
         .first()
@@ -320,37 +320,74 @@ fn cmd_extract(args: &[String]) -> Result<()> {
         }};
     }
 
-    // Peek only a small prefix for format detection so a 2bit file isn't slurped
-    // into memory just to fetch one region — the 2bit reader then opens it with
-    // seek+read. Other formats keep their existing whole-file path.
+    // A remote http(s) input is opened over HTTP range requests (UDC-style),
+    // never slurped. Format is auto-detected from a small prefix. This is the
+    // web-serving path the webseq benchmark exercises.
+    if file.starts_with("http://") || file.starts_with("https://") {
+        let rd = seqformat::open_url(file)?;
+        if regions.is_empty() {
+            regions = rd.names().iter().map(|n| (n.clone(), 0, None)).collect();
+        }
+        let out_seqs: Vec<seqformat::Sequence> = regions
+            .iter()
+            .map(|(n, s, e)| {
+                rd.extract(n, *s, *e)
+                    .map(|b| seqformat::Sequence::new(region_name(n, *s, *e), b))
+            })
+            .collect::<Result<_>>()?;
+        if o.flags.contains("http-stats") {
+            if let Some((reqs, bytes)) = rd.http_stats() {
+                eprintln!("http: {reqs} requests, {bytes} bytes");
+            }
+        }
+        write_extract_output(o.vals.get("out"), &out_seqs, width)?;
+        return Ok(());
+    }
+
+    // Peek only a small prefix for format detection so an indexed file isn't
+    // slurped into memory just to fetch one region — the reader then opens it
+    // seek-based. A few regions (per-fetch / "grab one contig") open seek-based
+    // for minimal latency; a large batch or extract-all amortises a single
+    // whole-file read, which beats thousands of per-region seeks.
     let prefix = read_prefix(file, 64)?;
+    let bulk = regions.is_empty() || regions.len() > 1024;
     let out_seqs: Vec<seqformat::Sequence> = if twobit::is_twobit(&prefix) {
-        // A few regions (the per-fetch / "grab one contig" case) open seek-based
-        // for minimal latency; a large batch or extract-all amortises a single
-        // whole-file read, which beats thousands of per-region seeks.
-        if regions.is_empty() || regions.len() > 1024 {
+        if bulk {
             run!(twobit::TwoBitReader::from_vec(std::fs::read(file)?)?)
         } else {
             run!(twobit::TwoBitReader::open(file)?)
         }
-    } else {
-        let data = std::fs::read(file)?;
-        if twobyte::is_twobyte(&data) {
-            run!(twobyte::TwoByteReader::from_vec(data)?)
-        } else if fourbit::is_fourbit(&data) {
-            run!(fourbit::FourBitReader::from_vec(data)?)
-        } else if samtools::is_bgzf(&data) || samtools::is_fasta(&data) {
-            run!(samtools::FaidxReader::open(file)?)
+    } else if twobyte::is_twobyte(&prefix) {
+        // 2be carries an on-disk B+ tree, so a seek-open lookup is O(log N).
+        if bulk {
+            run!(twobyte::TwoByteReader::from_vec(std::fs::read(file)?)?)
         } else {
-            run!(twobit::TwoBitReader::from_vec(data)?)
+            run!(twobyte::TwoByteReader::open(file)?)
         }
+    } else if fourbit::is_fourbit(&prefix) {
+        // 4bit has no index: a lookup must touch every record header either way,
+        // so one sequential slurp beats O(N) scattered seeks.
+        run!(fourbit::FourBitReader::from_vec(std::fs::read(file)?)?)
+    } else if samtools::is_bgzf(&prefix) || samtools::is_fasta(&prefix) {
+        run!(samtools::FaidxReader::open(file)?)
+    } else {
+        run!(twobit::TwoBitReader::from_vec(std::fs::read(file)?)?)
     };
 
-    match o.vals.get("out") {
-        Some(path) => fasta::write_file(path, &out_seqs, width)?,
+    write_extract_output(o.vals.get("out"), &out_seqs, width)
+}
+
+/// Write extracted sequences to `--out` (FASTA file) or stdout.
+fn write_extract_output(
+    out: Option<&String>,
+    seqs: &[seqformat::Sequence],
+    width: usize,
+) -> Result<()> {
+    match out {
+        Some(path) => fasta::write_file(path, seqs, width)?,
         None => {
             use std::io::Write;
-            let bytes = fasta::write_bytes(&out_seqs, width);
+            let bytes = fasta::write_bytes(seqs, width);
             std::io::stdout().write_all(&bytes)?;
         }
     }

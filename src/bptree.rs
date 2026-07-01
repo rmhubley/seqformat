@@ -22,10 +22,95 @@
 //!   internal: count × ( key[keySize], childOffset:u64 )   key = subtree min key
 //! ```
 
+use crate::error::Result;
 use crate::io::{peek_u16, peek_u32, peek_u64, put_u16, put_u32, put_u64};
+use crate::source::Source;
 
 const BLOCK_SIZE: usize = 256;
 const HDR: usize = 24;
+
+fn le64(b: &[u8]) -> u64 {
+    u64::from_le_bytes(b[..8].try_into().unwrap())
+}
+
+/// Seek-based lookup over a B+ tree blob living at absolute offset `base` in a
+/// [`Source`]. Reads only the nodes on the path — one per level — so a remote
+/// lookup is ~log_B(N) range reads (≈3 for fan-out 256), the whole point of the
+/// tree over a flat index. Mirrors [`Bpt::find`] exactly.
+pub(crate) fn find_src(src: &Source, base: usize, name: &str) -> Result<Option<u64>> {
+    let key_size = src.u32_at(base, true)? as usize;
+    if name.len() > key_size {
+        return Ok(None);
+    }
+    let mut q = name.as_bytes().to_vec();
+    q.resize(key_size, 0);
+    let stride = key_size + 8;
+    let mut off = src.u64_at(base + 16, true)? as usize; // root, blob-relative
+    loop {
+        let node = base + off;
+        let is_leaf = src.u8_at(node)? == 1;
+        let count = src.u16_at(node + 2, true)? as usize;
+        // Read the whole node's entries in one positioned read (good locality:
+        // one block per level remotely).
+        let buf = src.bytes_at(node + 4, count * stride)?;
+        if is_leaf {
+            for i in 0..count {
+                let b = i * stride;
+                if buf[b..b + key_size] == q[..] {
+                    return Ok(Some(le64(&buf[b + key_size..])));
+                }
+            }
+            return Ok(None);
+        }
+        // Internal: descend into the rightmost child whose min-key <= q.
+        let mut child = le64(&buf[key_size..]); // child 0 by default
+        for i in 0..count {
+            let b = i * stride;
+            if buf[b..b + key_size] <= q[..] {
+                child = le64(&buf[b + key_size..]);
+            } else {
+                break;
+            }
+        }
+        off = child as usize;
+    }
+}
+
+/// Seek-based full traversal (for listing names remotely). O(N) reads — only
+/// used by `names()`/extract-all, where touching every record is unavoidable.
+pub(crate) fn iter_all_src(src: &Source, base: usize) -> Result<Vec<(String, u64)>> {
+    let key_size = src.u32_at(base, true)? as usize;
+    let root = src.u64_at(base + 16, true)? as usize;
+    let mut out = Vec::new();
+    walk_src(src, base, key_size, root, &mut out)?;
+    Ok(out)
+}
+
+fn walk_src(
+    src: &Source,
+    base: usize,
+    key_size: usize,
+    off: usize,
+    out: &mut Vec<(String, u64)>,
+) -> Result<()> {
+    let stride = key_size + 8;
+    let node = base + off;
+    let is_leaf = src.u8_at(node)? == 1;
+    let count = src.u16_at(node + 2, true)? as usize;
+    let buf = src.bytes_at(node + 4, count * stride)?;
+    for i in 0..count {
+        let b = i * stride;
+        let val = le64(&buf[b + key_size..]);
+        if is_leaf {
+            let key = &buf[b..b + key_size];
+            let end = key.iter().position(|&c| c == 0).unwrap_or(key_size);
+            out.push((String::from_utf8_lossy(&key[..end]).into_owned(), val));
+        } else {
+            walk_src(src, base, key_size, val as usize, out)?;
+        }
+    }
+    Ok(())
+}
 
 enum Node {
     Leaf(Vec<(Vec<u8>, u64)>),
