@@ -109,6 +109,7 @@ an N-block, the scattered IUB dominate the N-block table (~490 k blocks/seq).
 | **2bit (seqformat)** | **82.8 MiB** | **2.315** | 2.39 s | **0.117 s** | **1.3 ms/fetch** ⁵ |
 | 2bit+IUB (seqformat) | 95.6 MiB | 2.672 | 3.52 s | 0.136 s | **1.3 ms/fetch** ⁵ |
 | 2bit+IUB+index (seqformat) | 95.6 MiB ⁴ | 2.672 | 3.53 s | 0.141 s | **1.3 ms/fetch** ⁵ |
+| 2bit+IUB+bptree (seqformat) | 95.6 MiB ⁴ | 2.672 | 3.74 s | 0.141 s | **1.4 ms/fetch** ⁵ |
 | 4bit (seqformat) | 143.1 MiB | 4.000 | 1.57 s | 0.134 s | 81.1 ms/fetch ³ |
 | 2be (seqformat) | 85.7 MiB | 2.396 | 2.60 s | 0.512 s | **1.9 ms/fetch** ⁵ |
 
@@ -126,12 +127,13 @@ Notes:
   a lookup must touch every record header — one sequential whole-file read beats
   O(N) scattered seeks, so the reader slurps 143 MB (81 ms single-fetch). Every
   other seqformat reader now seeks (note ⁵).
-- ⁴ The sorted-name index costs **8 bytes/sequence** + a 24-byte footer, so on
-  just 3 sequences it adds 40 bytes — size is unchanged to two decimals. With so
-  few sequences there is no O(N) index load to skip, so it neither helps nor
-  hurts per-fetch here; its payoff appears in the many-short-sequence table below.
-  (The `--bpt` B+ tree variant is likewise indistinguishable at N=3, so it's shown
-  only in the many-short and web tables where the index structure matters.)
+- ⁴ Both name indexes are negligible at N=3: the sorted array adds 8 bytes/seq +
+  a 24-byte footer (40 bytes total), and the `--bpt` B+ tree adds only ~40 bytes
+  more (the tree over 3 names) — so both are `95.6 MiB` / `2.672`, unchanged to
+  two decimals, and identical to the plain `2bit+IUB`. With so few sequences there
+  is no O(N) index load to skip, so neither helps nor hurts per-fetch here; the
+  index *structure* only separates them in the many-short and web tables, where
+  the duplicated-name cost of `--bpt` (and its remote payoff) actually appear.
 - ⁵ **All readers are now `Source`-backed `seek`+`read`** (like `twoBitToFa`'s
   `lseek`/`read`; `src/source.rs`): a single fetch reads only the header, the
   index probe path, and the requested window — never the whole file. This is the
