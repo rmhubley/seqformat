@@ -45,7 +45,7 @@ standard-library only.
 ## Usage
 
 ```
-seqformat fa2twobit  <in.fa> <out.2bit> [--long] [--iub] [--index]
+seqformat fa2twobit  <in.fa> <out.2bit> [--long] [--iub] [--index | --bpt]
 seqformat twobit2fa  <in.2bit> <out.fa> [--width N]
 seqformat fa2fourbit <in.fa> <out.4bit>
 seqformat fourbit2fa <in.4bit> <out.fa> [--width N]
@@ -130,6 +130,8 @@ Notes:
   just 3 sequences it adds 40 bytes — size is unchanged to two decimals. With so
   few sequences there is no O(N) index load to skip, so it neither helps nor
   hurts per-fetch here; its payoff appears in the many-short-sequence table below.
+  (The `--bpt` B+ tree variant is likewise indistinguishable at N=3, so it's shown
+  only in the many-short and web tables where the index structure matters.)
 - ⁵ **All readers are now `Source`-backed `seek`+`read`** (like `twoBitToFa`'s
   `lseek`/`read`; `src/source.rs`): a single fetch reads only the header, the
   index probe path, and the requested window — never the whole file. This is the
@@ -165,38 +167,46 @@ between the two tables.
 | BGZF (samtools) | 49.2 MiB | 2.754 | 5.43 s | 0.975 s | 244.8 ms/fetch ³ |
 | 2bit (seqformat, flat TOC) | 59.4 MiB | 3.320 | 1.60 s | 0.276 s | 173.1 ms/fetch ⁶ |
 | **2bit+IUB+index (seqformat, ptr array)** | 71.5 MiB | 3.997 | 2.42 s | **0.107 s** | **1.4 ms/fetch** ⁵ |
+| **2bit+IUB+bptree (seqformat, B+ tree)** | 75.8 MiB | 4.239 | 2.62 s | **0.114 s** | **1.3 ms/fetch** ⁵ |
 | 4bit (seqformat, no index) | 80.0 MiB | 4.474 | 0.94 s | 0.314 s | 244.6 ms/fetch ³ |
 | **2be (seqformat, B+ tree)** | 63.4 MiB | 3.545 | 1.72 s | **0.104 s** | **1.4 ms/fetch** ⁵ |
 
 The per-fetch column (open + fetch one sequence in a *separate* process — the
-real "grab a contig from a huge multi-FASTA" pattern) is the headline, and the
-two indexed formats **tie at 1.4 ms** — the sorted pointer array and the 2be B+
-tree both make the name lookup O(log N) (no 500k-entry TOC to load), and the
-`Source` seek+read reader (note ⁵) means the lookup probes and the one record are
-the only bytes touched. That's ~120× faster than our own flat-TOC 2bit reader,
-~64× faster than `twoBitToFa`, and ~175× faster than `samtools faidx`. Every
-non-indexed reader pays an O(N) cost per call — the flat-TOC 2bit rebuilds the
-whole 500k-entry TOC (173 ms ⁶), 4bit scans all 500k interleaved record headers
-(245 ms), `twoBitToFa` loads its index into a hash (89 ms), and `samtools faidx`
-loads its `.fai` (245 ms).
+real "grab a contig from a huge multi-FASTA" pattern) is the headline, and all
+three indexed formats **tie at ~1.4 ms** — the sorted pointer array, the appended
+B+ tree, and 2be's B+ tree all make the name lookup O(log N) (no 500k-entry TOC
+to load), and the `Source` seek+read reader (note ⁵) means the lookup probes and
+the one record are the only bytes touched. That's ~120× faster than our own
+flat-TOC 2bit reader, ~64× faster than `twoBitToFa`, and ~175× faster than
+`samtools faidx`. Every non-indexed reader pays an O(N) cost per call — the
+flat-TOC 2bit rebuilds the whole 500k-entry TOC (173 ms ⁶), 4bit scans all 500k
+interleaved record headers (245 ms), `twoBitToFa` loads its index into a hash
+(89 ms), and `samtools faidx` loads its `.fai` (245 ms).
 
-Two notes on the comparison:
+Three notes on the comparison:
 
-- **2be now matches the pointer array locally (both 1.4 ms).** Earlier 2be sat at
-  37 ms because its reader slurped the whole file; now that every reader is
-  `Source`-backed, its B+ tree delivers the O(log N) lookup its design promised.
-  Locally the two are a wash; the B+ tree's edge shows up **remotely**, where
-  round-trips dominate — see "Serving over the web" above (2be resolves a name in
-  ~3 node reads vs the pointer array's ~20 scattered probes).
-- **The index's payoff is the lookup, not the bytes.** 2bit+IUB+index is the
-  largest format here (71.5 MiB) — but that bulk is the *IUB* tables (standard
-  twoBit records every scattered degenerate as an 8-byte N-block, which 2be's
-  merged stream avoids), not the index. The pointer array itself is only ~3.8 MiB;
-  dropping `--iub` (index only) brings the file back near plain 2bit.
+- **Locally, the index *structure* doesn't matter — all three tie at ~1.4 ms.**
+  The measured per-fetch is dominated by process spawn + open, not the lookup
+  (which is microseconds either way). The pointer array's ~19 probes vs the B+
+  tree's ~3 node reads is invisible against that fixed overhead. The structure
+  only separates them **remotely**, where each access is a network round-trip —
+  see "Serving over the web" above.
+- **The `--bpt` variant duplicates the names to get 2be's remote speed *with*
+  backward compatibility.** It appends a full B+ tree (names inline) after the
+  standard TOC; legacy `twoBitToFa` ignores it. That costs **+4.3 MiB over
+  `--index`** here (the duplicated names) — and, being short `seq######` names,
+  this is a *best case*: realistic 15–25 byte names widen that penalty ~3× and
+  raise its remote request count (see the web section's caveat).
+- **The pointer array's size here is the *IUB* tables, not the index.**
+  2bit+IUB+index is 71.5 MiB, but that bulk is the scattered-degenerate N-blocks
+  (which 2be's merged stream avoids); the pointer array itself is only ~3.8 MiB.
+  Dropping `--iub` brings the file back near plain 2bit.
 
-The takeaway: for the **local** exact-name lookup, a flat sorted pointer array —
-8 bytes/sequence, fully twoBit backward compatible — matches 2be's incompatible
-B+ tree. Over the **web**, the B+ tree's higher fan-out pulls ahead on round-trips.
+The takeaway: for **local** exact-name lookup, all three index structures are a
+wash — the flat 8-byte pointer array (backward compatible, smallest) is the
+obvious pick. The structure only earns its keep **over the web**, where the B+
+tree's fan-out cuts round-trips — and `--bpt` gets that remotely without giving
+up twoBit compatibility, at the cost of the duplicated name bytes.
 
 > ⁶ The flat-TOC 2bit reader is seek-based too (note ⁵), so it no longer reads the
 > whole 59 MB file — but with no name index it must still load the entire 500k-entry
@@ -251,23 +261,40 @@ and stable):
 
 | format | index structure | ms/fetch | HTTP requests | bytes/fetch |
 |---|---|--:|--:|--:|
-| 2bit standard | flat, unsorted TOC | 240 | 3.9 | 6.7 MiB |
-| 2bit + index | sorted pointer array | 82 | 21.7 | 170 KiB |
-| **2be** | **on-disk B+ tree (fan-out 256)** | **22** | **7.0** | **49 KiB** |
+| 2bit standard | flat, unsorted TOC | 242 | 3.9 | 6.7 MiB |
+| 2bit + index | sorted pointer array | 83 | 21.7 | 170 KiB |
+| **2bit + B+ tree** (`--bpt`) | **B+ tree, TOC duplicate** | **18** | **6.6** | **52 KiB** |
+| 2be | on-disk B+ tree (fan-out 256) | 20 | 7.0 | 49 KiB |
+| 4bit | none (interleaved) | — ¹ | 10241 | 84 MiB |
+| faidx (plain) | `.fai` sidecar | — ¹ | 3 | 14.6 MiB |
+| faidx (BGZF) | `.fai` + block scan | — ¹ | 2431 | 34.5 MiB |
 
 - **Standard 2bit** has no ordered in-file index, so resolving one name pulls the
   **entire TOC** (O(N) bytes) — 6.7 MiB every open, bandwidth-bound.
 - **2bit + index** binary-searches its sorted array — O(log₂N), but the probes
   scatter across the TOC (a pointer then a distant name), so ~22 small reads.
-- **2be**'s B+ tree packs keys per node, so a lookup touches ~3 nodes; it wins
-  both latency and bytes — the ideal remote shape, and the same ~1.4 ms locally.
-- **4bit and faidx are O(N) on open, by design.** 4bit has no index, so a lookup
-  scans every interleaved record header — ~10.2k requests / 84 MiB (essentially
-  the whole file). faidx must first pull its entire `.fai` sidecar (the index):
-  ~1.37 MiB for a plain 50k-seq FASTA (the `.fai` load dominates the window read),
-  and BGZF adds an O(blocks) header scan. `--http-stats` folds the `.fai` fetch
-  into the reported total, so faidx isn't flattered by hiding its index load. A
-  remote faidx therefore needs its `.fai` served alongside the file.
+- **`2bit + B+ tree`** appends a full B+ tree (names inline, a TOC duplicate);
+  a lookup touches ~3 nodes → **it matches 2be remotely while staying fully
+  twoBit backward compatible** (legacy `twoBitToFa` ignores the appended blob).
+  The price is storage: the duplicated names (+4.3 MiB over `--index` here).
+- **2be**'s B+ tree gives the same ~7-request shape, but is not twoBit compatible
+  (different record encoding). `--bpt` is how you get 2be's remote lookup on a
+  standard 2bit.
+- ¹ **4bit and faidx are O(N) on open, by design** (shown as a single fetch — a
+  timed loop would be dominated by these). 4bit has no index, so a lookup scans
+  every interleaved record header (~84 MiB, ~the whole file). faidx first pulls
+  its entire `.fai` sidecar — **14.6 MiB** at 500k seqs — which dominates; BGZF
+  adds an O(blocks) header scan. `--http-stats` folds the `.fai` fetch into the
+  total, so faidx isn't flattered by hiding its index load. A remote faidx needs
+  its `.fai` served alongside the file.
+
+**Caveat — these numbers assume short names.** The benchmark uses `seq0…seq499999`
+(4–9 bytes). The B+ tree pads keys to the longest name and inlines them, so with
+short names its duplication penalty (+4.3 MiB) and its node packing (one 8 KiB
+block per level → ~7 requests) are a *best case*. Realistic 15–25 byte names
+(`scaffold_000123`, accessions) roughly **triple** the `--bpt`-vs-`--index`
+storage gap and can push tree nodes across two blocks (~7 → ~10–13 requests). The
+ranking holds, but the exact tree numbers are name-length-sensitive.
 
 ```sh
 bash bench/webseq.sh    # FORMATS="label=url ..." FETCHES=15 to customize
@@ -394,6 +421,20 @@ This is the backward-compatible counterpart to 2be's B+ tree: a flat pointer
 array gives the same O(log N) exact-name lookup at lower redundancy (no padded
 key copies), trading away the B+ tree's range scans and disk-paging locality —
 neither of which exact-name fetch needs.
+
+**`--bpt` — the B+ tree variant.** For the *remote* case (see "Serving over the
+web"), the pointer array's disk locality *does* matter: each of its ~log₂N probes
+is a separate scattered HTTP range read (a pointer, then a distant name). `--bpt`
+instead appends a **full [`bptree`] blob** — the same on-disk B+ tree 2be uses,
+with names stored inline — as a *complete duplicate* of the TOC, under a distinct
+footer magic (`0x58545042`, "BPTX"). Because keys are co-located per node, a
+lookup touches ~log₂₅₆N ≈ 3 nodes instead of ~19 scattered probes, cutting remote
+requests ~22 → ~7 (it matches 2be). It stays fully twoBit compatible — the blob
+sits past the last record, invisible to legacy readers — at the cost of the
+duplicated name bytes (**~name-length per sequence**; +4.3 MiB on 500k short
+names, proportionally more on realistic ones). Use `--bpt` instead of `--index`
+when serving over HTTP; use `--index` (or nothing) for local-only files, where
+the structure makes no measurable difference.
 
 ### 4-bit (BWA/BAM style)
 
