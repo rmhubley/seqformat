@@ -76,6 +76,7 @@
 //! a legacy reader — which reaches records purely through index offsets — never
 //! sees it.
 
+use crate::bptree;
 use crate::error::{fmt_err, Result};
 use crate::io::{peek_u32, peek_u64, put_u32, put_u64, put_u8, Reader};
 use crate::seq::{
@@ -95,11 +96,42 @@ const IUB_EXT_VERSION: u32 = 1;
 /// reads `I N D X`. It must differ from `IUB_EXT_VERSION` (the last 4 bytes of
 /// the plain IUB trailer) so the two trailers never alias.
 const INDEX_FOOTER_MAGIC: u32 = 0x5844_4E49;
+/// Magic for the EOF footer of a B+ tree-indexed file. As little-endian bytes
+/// this reads `B P T X`. Same footer layout as the sorted-name index, but the
+/// appended structure is a full [`crate::bptree`] blob (names inline) instead of
+/// a pointer array — a complete duplicate of the TOC, for O(log_B N) lookups
+/// (few round-trips) at the cost of the duplicated name bytes.
+const BPT_FOOTER_MAGIC: u32 = 0x5854_5042;
 /// Footer flag: the records carry per-record IUB tables.
 const INDEX_FLAG_IUB: u32 = 1;
 /// Size of the name-index footer in bytes: indexOffset u64, count u64,
 /// flags u32, magic u32.
 const INDEX_FOOTER_SIZE: usize = 24;
+
+/// Which optional name index (if any) a file carries at EOF.
+#[derive(Clone, Copy)]
+enum NameIndex {
+    /// No index; look names up via the flat TOC.
+    None,
+    /// Sorted pointer array at `off` with `count` entries (points back into TOC).
+    Ptr { off: usize, count: usize },
+    /// A B+ tree blob (`bptree`) at `off` — names inline, a full TOC duplicate.
+    Bpt { off: usize },
+}
+
+impl NameIndex {
+    fn is_some(&self) -> bool {
+        !matches!(self, NameIndex::None)
+    }
+}
+
+/// How a file's optional name index is serialized (encoder side).
+#[derive(Clone, Copy, PartialEq)]
+enum IndexKind {
+    None,
+    Ptr,
+    Bpt,
+}
 
 /// A parsed twoBit file plus the flavour flags we detected.
 #[derive(Debug, Clone)]
@@ -239,16 +271,25 @@ fn encode_record(bases: &[u8], iub: bool) -> Vec<u8> {
 /// * `long`: write 64-bit index offsets (version 1).
 /// * `iub`:  append per-record IUB tables and the discovery trailer.
 pub fn to_bytes(seqs: &[Sequence], long: bool, iub: bool) -> Result<Vec<u8>> {
-    build(seqs, long, iub, false)
+    build(seqs, long, iub, IndexKind::None)
 }
 
 /// Like [`to_bytes`] but also append the backward-compatible sorted-name index
 /// (and an index footer in place of the plain IUB trailer). See the module docs.
 pub fn to_bytes_indexed(seqs: &[Sequence], long: bool, iub: bool) -> Result<Vec<u8>> {
-    build(seqs, long, iub, true)
+    build(seqs, long, iub, IndexKind::Ptr)
 }
 
-fn build(seqs: &[Sequence], long: bool, iub: bool, index: bool) -> Result<Vec<u8>> {
+/// Like [`to_bytes_indexed`] but append a full **B+ tree** name index (a complete
+/// duplicate of the TOC, names inline) instead of the sorted pointer array. Still
+/// fully twoBit backward compatible — legacy readers ignore the appended blob —
+/// and gives O(log_B N) lookups with far fewer round-trips over HTTP, at the cost
+/// of the duplicated name bytes.
+pub fn to_bytes_bptree(seqs: &[Sequence], long: bool, iub: bool) -> Result<Vec<u8>> {
+    build(seqs, long, iub, IndexKind::Bpt)
+}
+
+fn build(seqs: &[Sequence], long: bool, iub: bool, kind: IndexKind) -> Result<Vec<u8>> {
     for s in seqs {
         if s.name.len() > 255 {
             return fmt_err(format!(
@@ -272,12 +313,11 @@ fn build(seqs: &[Sequence], long: bool, iub: bool, index: bool) -> Result<Vec<u8
     let header_size = 16usize;
     let index_size: usize = seqs.iter().map(|s| 1 + s.name.len() + off_size).sum();
 
-    let trailer = if index {
-        seqs.len() * 8 + INDEX_FOOTER_SIZE
-    } else if iub {
-        8
-    } else {
-        0
+    let trailer = match kind {
+        IndexKind::Ptr => seqs.len() * 8 + INDEX_FOOTER_SIZE,
+        IndexKind::Bpt => seqs.len() * 24 + INDEX_FOOTER_SIZE, // rough: keys+values
+        IndexKind::None if iub => 8,
+        IndexKind::None => 0,
     };
     let mut out = Vec::with_capacity(
         header_size + index_size + records.iter().map(|r| r.len()).sum::<usize>() + trailer,
@@ -292,9 +332,11 @@ fn build(seqs: &[Sequence], long: bool, iub: bool, index: bool) -> Result<Vec<u8
     // Index — compute absolute record offsets, remembering where each entry
     // begins so the optional name index can point back at it.
     let mut entry_offsets = Vec::with_capacity(seqs.len());
+    let mut rec_offsets = Vec::with_capacity(seqs.len());
     let mut offset = header_size + index_size;
     for (s, rec) in seqs.iter().zip(&records) {
         entry_offsets.push(out.len());
+        rec_offsets.push(offset);
         put_u8(&mut out, s.name.len() as u8);
         out.extend_from_slice(s.name.as_bytes());
         if long {
@@ -310,43 +352,68 @@ fn build(seqs: &[Sequence], long: bool, iub: bool, index: bool) -> Result<Vec<u8
         out.extend_from_slice(rec);
     }
 
-    if index {
-        // Sorted pointer array: one u64 per sequence, ordered by name, pointing
-        // at the index entry above. Names live only in that entry.
-        let index_offset = out.len();
-        let mut order: Vec<usize> = (0..seqs.len()).collect();
-        order.sort_by(|&a, &b| seqs[a].name.as_bytes().cmp(seqs[b].name.as_bytes()));
-        for &i in &order {
-            put_u64(&mut out, entry_offsets[i] as u64);
+    match kind {
+        IndexKind::Ptr => {
+            // Sorted pointer array: one u64 per sequence, ordered by name,
+            // pointing at the index entry above. Names live only in that entry.
+            let index_offset = out.len();
+            let mut order: Vec<usize> = (0..seqs.len()).collect();
+            order.sort_by(|&a, &b| seqs[a].name.as_bytes().cmp(seqs[b].name.as_bytes()));
+            for &i in &order {
+                put_u64(&mut out, entry_offsets[i] as u64);
+            }
+            put_index_footer(&mut out, index_offset, seqs.len(), iub, INDEX_FOOTER_MAGIC);
         }
-        // Footer (discovery + IUB advertisement).
-        put_u64(&mut out, index_offset as u64);
-        put_u64(&mut out, seqs.len() as u64);
-        put_u32(&mut out, if iub { INDEX_FLAG_IUB } else { 0 });
-        put_u32(&mut out, INDEX_FOOTER_MAGIC);
-    } else if iub {
-        // Discovery trailer for the IUB extension.
-        put_u32(&mut out, IUB_TRAILER_MAGIC);
-        put_u32(&mut out, IUB_EXT_VERSION);
+        IndexKind::Bpt => {
+            // Full B+ tree (name -> record offset), names inline: a complete
+            // duplicate of the TOC appended at EOF.
+            let bpt_offset = out.len();
+            let items: Vec<(String, u64)> = seqs
+                .iter()
+                .zip(&rec_offsets)
+                .map(|(s, &o)| (s.name.clone(), o as u64))
+                .collect();
+            out.extend_from_slice(&bptree::build(items));
+            put_index_footer(&mut out, bpt_offset, seqs.len(), iub, BPT_FOOTER_MAGIC);
+        }
+        IndexKind::None if iub => {
+            // Discovery trailer for the IUB extension.
+            put_u32(&mut out, IUB_TRAILER_MAGIC);
+            put_u32(&mut out, IUB_EXT_VERSION);
+        }
+        IndexKind::None => {}
     }
 
     Ok(out)
 }
 
-/// Inspect the EOF trailer/footer. Returns `(iub, name_index)` where
-/// `name_index` is `Some((ptr_array_offset, count))` for an indexed file.
-fn detect_trailer(data: &[u8], little: bool) -> (bool, Option<(usize, usize)>) {
+/// Append the shared 24-byte EOF footer: `offset u64, count u64, flags u32, magic`.
+fn put_index_footer(out: &mut Vec<u8>, offset: usize, count: usize, iub: bool, magic: u32) {
+    put_u64(out, offset as u64);
+    put_u64(out, count as u64);
+    put_u32(out, if iub { INDEX_FLAG_IUB } else { 0 });
+    put_u32(out, magic);
+}
+
+/// Inspect the EOF trailer/footer. Returns `(iub, name_index)`.
+fn detect_trailer(data: &[u8], little: bool) -> (bool, NameIndex) {
     let n = data.len();
-    if n >= INDEX_FOOTER_SIZE
-        && peek_u32(data, n - 4, little) == Some(INDEX_FOOTER_MAGIC)
-    {
-        let index_offset = peek_u64(data, n - INDEX_FOOTER_SIZE, little).unwrap_or(0) as usize;
-        let count = peek_u64(data, n - 16, little).unwrap_or(0) as usize;
-        let flags = peek_u32(data, n - 8, little).unwrap_or(0);
-        return (flags & INDEX_FLAG_IUB != 0, Some((index_offset, count)));
+    if n >= INDEX_FOOTER_SIZE {
+        let magic = peek_u32(data, n - 4, little);
+        if magic == Some(INDEX_FOOTER_MAGIC) || magic == Some(BPT_FOOTER_MAGIC) {
+            let off = peek_u64(data, n - INDEX_FOOTER_SIZE, little).unwrap_or(0) as usize;
+            let count = peek_u64(data, n - 16, little).unwrap_or(0) as usize;
+            let flags = peek_u32(data, n - 8, little).unwrap_or(0);
+            let idx = if magic == Some(BPT_FOOTER_MAGIC) {
+                NameIndex::Bpt { off }
+            } else {
+                NameIndex::Ptr { off, count }
+            };
+            return (flags & INDEX_FLAG_IUB != 0, idx);
+        }
     }
     let iub = n >= 8 && peek_u32(data, n - 8, little) == Some(IUB_TRAILER_MAGIC);
-    (iub, None)
+    (iub, NameIndex::None)
 }
 
 // ---------------------------------------------------------------------------
@@ -516,8 +583,8 @@ pub struct TwoBitReader {
     pub long: bool,
     pub iub: bool,
     count: usize,
-    /// `(ptr_array_offset, count)` when the file carries the sorted-name index.
-    name_index: Option<(usize, usize)>,
+    /// The optional appended name index (sorted pointer array or B+ tree).
+    name_index: NameIndex,
     flat: std::cell::OnceCell<FlatToc>,
 }
 
@@ -581,7 +648,7 @@ impl TwoBitReader {
         })
     }
 
-    /// Whether this file carries the backward-compatible name index.
+    /// Whether this file carries a backward-compatible name index.
     pub fn has_name_index(&self) -> bool {
         self.name_index.is_some()
     }
@@ -622,18 +689,20 @@ impl TwoBitReader {
     }
 
     /// Resolve a sequence name to its record offset. Uses the sorted pointer
-    /// array (O(log N)) when present, else the flat TOC map.
+    /// array or the B+ tree (both O(log N), no full-TOC load) when present, else
+    /// the flat TOC map.
     fn record_offset(&self, name: &str) -> Result<usize> {
-        if let Some((idx_off, n)) = self.name_index {
-            return self
-                .lookup_indexed(idx_off, n, name)?
-                .ok_or_else(|| crate::error::Error::Format(format!("no sequence named {name:?}")));
+        let not_found =
+            || crate::error::Error::Format(format!("no sequence named {name:?}"));
+        match self.name_index {
+            NameIndex::Ptr { off, count } => {
+                self.lookup_indexed(off, count, name)?.ok_or_else(not_found)
+            }
+            NameIndex::Bpt { off } => bptree::find_src(&self.src, off, name)?
+                .map(|v| v as usize)
+                .ok_or_else(not_found),
+            NameIndex::None => self.flat()?.by_name.get(name).copied().ok_or_else(not_found),
         }
-        self.flat()?
-            .by_name
-            .get(name)
-            .copied()
-            .ok_or_else(|| crate::error::Error::Format(format!("no sequence named {name:?}")))
     }
 
     /// Binary-search the sorted pointer array. Each probe dereferences a pointer
@@ -818,20 +887,26 @@ fn for_overlapping_blocks(
 
 /// Source-backed twin of [`detect_trailer`] for the seek reader: reads only the
 /// last few bytes rather than requiring the whole file in memory.
-fn detect_trailer_src(src: &Source, little: bool) -> Result<(bool, Option<(usize, usize)>)> {
+fn detect_trailer_src(src: &Source, little: bool) -> Result<(bool, NameIndex)> {
     let len = src.len();
-    if len >= INDEX_FOOTER_SIZE
-        && src.u32_at(len - 4, little)? == INDEX_FOOTER_MAGIC
-    {
-        let index_offset = src.u64_at(len - INDEX_FOOTER_SIZE, little)? as usize;
-        let count = src.u64_at(len - 16, little)? as usize;
-        let flags = src.u32_at(len - 8, little)?;
-        return Ok((flags & INDEX_FLAG_IUB != 0, Some((index_offset, count))));
+    if len >= INDEX_FOOTER_SIZE {
+        let magic = src.u32_at(len - 4, little)?;
+        if magic == INDEX_FOOTER_MAGIC || magic == BPT_FOOTER_MAGIC {
+            let off = src.u64_at(len - INDEX_FOOTER_SIZE, little)? as usize;
+            let count = src.u64_at(len - 16, little)? as usize;
+            let flags = src.u32_at(len - 8, little)?;
+            let idx = if magic == BPT_FOOTER_MAGIC {
+                NameIndex::Bpt { off }
+            } else {
+                NameIndex::Ptr { off, count }
+            };
+            return Ok((flags & INDEX_FLAG_IUB != 0, idx));
+        }
     }
     if len >= 8 && src.u32_at(len - 8, little)? == IUB_TRAILER_MAGIC {
-        return Ok((true, None));
+        return Ok((true, NameIndex::None));
     }
-    Ok((false, None))
+    Ok((false, NameIndex::None))
 }
 
 // ---------------------------------------------------------------------------
@@ -851,6 +926,17 @@ pub fn write_file_indexed(
     iub: bool,
 ) -> Result<()> {
     fs::write(path, to_bytes_indexed(seqs, long, iub)?)?;
+    Ok(())
+}
+
+/// Like [`write_file`] but append a full B+ tree name index (TOC duplicate).
+pub fn write_file_bptree(
+    path: impl AsRef<Path>,
+    seqs: &[Sequence],
+    long: bool,
+    iub: bool,
+) -> Result<()> {
+    fs::write(path, to_bytes_bptree(seqs, long, iub)?)?;
     Ok(())
 }
 
@@ -1064,6 +1150,36 @@ mod tests {
     }
 
     #[test]
+    fn bptree_indexed_reader() {
+        // A B+ tree-indexed file resolves names via the tree, decodes correctly,
+        // and stays a valid plain twoBit (from_bytes reads it via the TOC).
+        let s: Vec<Sequence> = (0..600)
+            .map(|i| seq(&format!("seq{i:04}"), "ACGTNNNacgtRYSWacgtKMB"))
+            .collect();
+        let bytes = to_bytes_bptree(&s, false, true).unwrap();
+        // Legacy/eager decode through the TOC still works (backward compatible).
+        let full = from_bytes(&bytes).unwrap().sequences;
+        assert_eq!(full.len(), 600);
+
+        let rd = TwoBitReader::from_vec(bytes.clone()).unwrap();
+        assert!(rd.has_name_index());
+        for orig in s.iter().step_by(31) {
+            assert_eq!(rd.extract(&orig.name, 0, None).unwrap(), orig.bases, "{}", orig.name);
+        }
+        assert!(rd.extract("missing", 0, None).is_err());
+        // Seek (File) source resolves through the tree identically to memory.
+        let dir = std::env::temp_dir().join("seqfmt_bpt_reader");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.bpt.2bit");
+        std::fs::write(&path, &bytes).unwrap();
+        let rf = TwoBitReader::open(&path).unwrap();
+        for orig in s.iter().step_by(31) {
+            assert_eq!(rf.extract(&orig.name, 0, None).unwrap(), orig.bases, "seek {}", orig.name);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn file_backed_reader_matches_mem() {
         // The seek+read (File) source must decode byte-for-byte like the in-memory
         // source across every window, for plain / long / iub / indexed flavours.
@@ -1073,14 +1189,16 @@ mod tests {
             seq("seqM", "ACGTacgtACGTnnnNNNacgtryswKMB"),
         ];
         let combos = [
-            (false, false, false),
-            (false, true, false),
-            (true, true, true),
-            (false, true, true),
-            (false, false, true),
+            (false, false, IndexKind::None),
+            (false, true, IndexKind::None),
+            (true, true, IndexKind::Ptr),
+            (false, true, IndexKind::Ptr),
+            (false, false, IndexKind::Ptr),
+            (false, true, IndexKind::Bpt),
+            (true, true, IndexKind::Bpt),
         ];
-        for (ci, &(long, iub, index)) in combos.iter().enumerate() {
-            let bytes = build(&s, long, iub, index).unwrap();
+        for (ci, &(long, iub, kind)) in combos.iter().enumerate() {
+            let bytes = build(&s, long, iub, kind).unwrap();
             let mem = TwoBitReader::from_vec(bytes.clone()).unwrap();
 
             let path = std::env::temp_dir().join(format!(
@@ -1092,7 +1210,7 @@ mod tests {
 
             assert_eq!(file.iub, mem.iub);
             assert_eq!(file.long, mem.long);
-            assert_eq!(file.has_name_index(), index);
+            assert_eq!(file.has_name_index(), kind != IndexKind::None);
 
             for src in &s {
                 let n = src.bases.len();

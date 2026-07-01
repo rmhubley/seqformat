@@ -23,7 +23,7 @@
 set -euo pipefail
 
 BASE=${BASE:-https://repeatmasker.org/~rhubley}
-FORMATS=${FORMATS:-"2bit-std=$BASE/seqformat-std.2bit 2bit-idx=$BASE/seqformat-idx.2bit 2be=$BASE/seqformat.2be"}
+FORMATS=${FORMATS:-"2bit-std=$BASE/seqformat-std.2bit 2bit-idx=$BASE/seqformat-idx.2bit 2bit-bpt=$BASE/seqformat-bpt.2bit 2be=$BASE/seqformat.2be"}
 FETCHES=${FETCHES:-15}
 COUNT=${COUNT:-500000}
 BIN=${BIN:-./target/release/seqformat}

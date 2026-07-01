@@ -73,19 +73,27 @@ ambiguity), `info`.
 
   | format | ms/fetch | req/fetch | KiB/fetch |
   |---|--:|--:|--:|
-  | 2bit std (flat TOC)     | 240 | 3.9  | 6743 |
-  | 2bit idx (sorted array) |  82 | 21.7 |  170 |
-  | **2be (B+ tree)**       | **22** | **7.0** | **49** |
+  | 2bit std (flat TOC)          | 242 | 3.9  | 6743 |
+  | 2bit idx (sorted array)      |  83 | 21.7 |  170 |
+  | **2bit +bptree (`--bpt`)**   | **18** | **6.6** | **52** |
+  | 2be (B+ tree)                |  20 | 7.0  |   49 |
+  | 4bit (no index) ¹            |  —  | 10241 | 84 MiB |
+  | faidx plain (`.fai`) ¹       |  —  | 3    | 14.6 MiB |
+  | faidx bgzf ¹                 |  —  | 2431 | 34.5 MiB |
 
-  (ms/fetch varies with the network; req/bytes are stable.) The story from the
-  theory holds: flat TOC pulls O(N) bytes (whole TOC) every open; the sorted index
-  does ~log₂N *scattered* probes (poor locality — a block-size sweep leaves it at
-  ~15–25 requests); the **2be on-disk B+ tree (fan-out 256, `bptree::find_src`)
-  hits the ideal ~3-node lookup**, so it wins both latency and bytes. 4bit (no
-  index) is O(N) on open — ~10k req / 84 MiB, it scans every interleaved record
-  header. faidx pulls its whole `.fai` (~1.37 MiB for 50k seqs — folded into
-  `--http-stats`) then a window read (plain) or a BGZF block-header scan
-  (O(blocks)). Benchmarked by `bench/webseq.sh`.
+  ¹ single fetch (O(N) on open; a timed loop would be dominated by these). The
+  story from the theory holds: flat TOC pulls O(N) bytes (whole TOC) every open;
+  the sorted index does ~log₂N *scattered* probes (~15–25 requests); the **B+
+  tree (fan-out 256, `bptree::find_src`) hits the ideal ~3-node lookup**. The new
+  **`--bpt`** format (2bit + IUB + a full B+ tree appended as a TOC duplicate,
+  `BPT_FOOTER_MAGIC`) **matches 2be remotely while staying twoBit backward
+  compatible** — at the cost of duplicated names (+4.3 MiB over `--index` on 500k
+  short names; more on realistic names). 4bit scans every record header (~whole
+  file); faidx pulls its whole `.fai` (14.6 MiB at 500k — folded into
+  `--http-stats`) then a window read / BGZF block scan. `bench/webseq.sh`.
+  NOTE: names are `seq0…seq499999` (4–9 B) → best case for `--bpt`'s size + node
+  packing; realistic 15–25 B names widen the gap ~3× and push tree nodes toward
+  2 blocks/level (~7 → ~10–13 req).
 
   **Local per-fetch** now matches: `cmd_extract` routes single-region 2be through
   the seek path too (was slurping), so 2be local dropped **37 ms → 1.4 ms**,

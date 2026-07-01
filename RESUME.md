@@ -40,6 +40,15 @@ FETCHES=15 bash bench/webseq.sh
 ```
 
 ## Done since first checkpoint
+- **New format `--bpt`** (`fa2twobit --iub --bpt`): 2bit + IUB + a full B+ tree
+  appended as a *complete TOC duplicate* (`BPT_FOOTER_MAGIC`, names inline).
+  Fully twoBit backward compatible (verified `twoBitToFa` reads it). Reader uses
+  `bptree::find_src` (seek/HTTP). Web: **18 ms / 6.6 req / 52 KiB — matches 2be**
+  while staying compatible, vs idx 83/22/170. Local ties idx/2be (~1.3 ms).
+  Size 75.8 MiB (+4.3 over idx = duplicated names). Caveat baked into docs: bench
+  names are `seq+index` (4–9 B) → best case; realistic names ~3× the size gap and
+  ~10–13 req. 20 tests pass. In manyseq.sh + webseq.sh. User declined a
+  realistic-name rerun for now.
 - Final all-formats validation sweep: **passed** (remote==local for all).
 - `cmd_extract` now routes single-region **2be** through the seek path (was
   slurping) → 2be local per-fetch **37 ms → 1.4 ms**; BGZF few-big **95 → 8 ms**.
