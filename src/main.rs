@@ -161,13 +161,16 @@ fn parse(args: &[String], bool_flags: &[&str], val_flags: &[&str]) -> Result<Opt
 // ---- commands ----
 
 fn cmd_fa2twobit(args: &[String]) -> Result<()> {
-    let o = parse(args, &["long", "iub", "index"], &[])?;
+    let o = parse(args, &["long", "iub", "index", "bpt"], &[])?;
     let (input, output) = two(&o, "fa2twobit")?;
     let seqs = fasta::read_file(input)?;
     let long = o.flags.contains("long");
     let iub = o.flags.contains("iub");
     let index = o.flags.contains("index");
-    if index {
+    let bpt = o.flags.contains("bpt");
+    if bpt {
+        twobit::write_file_bptree(output, &seqs, long, iub)?;
+    } else if index {
         twobit::write_file_indexed(output, &seqs, long, iub)?;
     } else {
         twobit::write_file(output, &seqs, long, iub)?;
@@ -177,7 +180,13 @@ fn cmd_fa2twobit(args: &[String]) -> Result<()> {
         seqs.len(),
         if long { "long" } else { "standard" },
         if iub { " + IUB extension" } else { "" },
-        if index { " + name index" } else { "" }
+        if bpt {
+            " + B+ tree index"
+        } else if index {
+            " + name index"
+        } else {
+            ""
+        }
     );
     Ok(())
 }
