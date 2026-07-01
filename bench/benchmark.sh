@@ -82,6 +82,7 @@ enc_ucsc_2bit()  { faToTwoBit "$FA" "$WORKDIR/ucsc.2bit"; }
 enc_our_std()    { "$BIN" fa2twobit "$FA" "$WORKDIR/our.std.2bit"; }
 enc_our_iub()    { "$BIN" fa2twobit "$FA" "$WORKDIR/our.iub.2bit" --iub; }
 enc_our_idx()    { "$BIN" fa2twobit "$FA" "$WORKDIR/our.idx.2bit" --iub --index; }
+enc_our_bpt()    { "$BIN" fa2twobit "$FA" "$WORKDIR/our.bpt.2bit" --iub --bpt; }
 enc_our_4bit()   { "$BIN" fa2fourbit "$FA" "$WORKDIR/our.4bit"; }
 enc_our_bgzf()   { "$BIN" fa2faidx "$FA" "$WORKDIR/our.fa.gz" --bgzip; }
 enc_our_2be()    { "$BIN" fa2be "$FA" "$WORKDIR/our.2be"; }
@@ -92,6 +93,7 @@ ext_ucsc()       { twoBitToFa -seqList="$WORKDIR/reg0.txt" "$WORKDIR/ucsc.2bit" 
 ext_our_std()    { "$BIN" extract "$WORKDIR/our.std.2bit" --seq-list "$WORKDIR/reg0.txt" --out "$WORKDIR/o.std.fa"; }
 ext_our_iub()    { "$BIN" extract "$WORKDIR/our.iub.2bit" --seq-list "$WORKDIR/reg0.txt" --out "$WORKDIR/o.iub.fa"; }
 ext_our_idx()    { "$BIN" extract "$WORKDIR/our.idx.2bit" --seq-list "$WORKDIR/reg0.txt" --out "$WORKDIR/o.idx.fa"; }
+ext_our_bpt()    { "$BIN" extract "$WORKDIR/our.bpt.2bit" --seq-list "$WORKDIR/reg0.txt" --out "$WORKDIR/o.bpt.fa"; }
 ext_our_4bit()   { "$BIN" extract "$WORKDIR/our.4bit"     --seq-list "$WORKDIR/reg0.txt" --out "$WORKDIR/o.4bit.fa"; }
 ext_our_bgzf()   { "$BIN" extract "$WORKDIR/our.fa.gz"    --seq-list "$WORKDIR/reg0.txt" --out "$WORKDIR/o.ourbgzf.fa"; }
 ext_our_2be()    { "$BIN" extract "$WORKDIR/our.2be"      --seq-list "$WORKDIR/reg0.txt" --out "$WORKDIR/o.2be.fa"; }
@@ -99,7 +101,7 @@ ext_sam()        { samtools faidx -r "$WORKDIR/reg1.txt" "$WORKDIR/sam.fa.gz" -o
 
 echo "Building all formats once..."
 have faToTwoBit && enc_ucsc_2bit
-enc_our_std; enc_our_iub; enc_our_idx; enc_our_4bit; enc_our_bgzf; enc_our_2be
+enc_our_std; enc_our_iub; enc_our_idx; enc_our_bpt; enc_our_4bit; enc_our_bgzf; enc_our_2be
 have bgzip && have samtools && enc_sam || true
 
 # ---- block counts (shows how clustering affects the 2bit block tables) ------
@@ -127,6 +129,7 @@ fi
 rs "2bit (seqformat)" "$(sizeof "$WORKDIR/our.std.2bit")"
 rs "2bit+IUB (seqformat)" "$(sizeof "$WORKDIR/our.iub.2bit")"
 rs "2bit+IUB+index (seqformat)" "$(sizeof "$WORKDIR/our.idx.2bit")"
+rs "2bit+IUB+bptree (seqformat)" "$(sizeof "$WORKDIR/our.bpt.2bit")"
 rs "4bit (seqformat)" "$(sizeof "$WORKDIR/our.4bit")"
 rs "2be (seqformat)" "$(sizeof "$WORKDIR/our.2be")"
 
@@ -149,6 +152,8 @@ if have twoBitToFa; then
   # The indexed file must still read as a plain 2bit through the UCSC tool.
   twoBitToFa -seqList="$WORKDIR/reg0.txt" "$WORKDIR/our.idx.2bit" "$WORKDIR/o.idx.ucsc.fa" 2>/dev/null \
     && check "UCSC twoBitToFa reads 2bit+IUB+index (degenerate=N)" "$ourstd" "$(seqonly_md5 "$WORKDIR/o.idx.ucsc.fa")"
+  twoBitToFa -seqList="$WORKDIR/reg0.txt" "$WORKDIR/our.bpt.2bit" "$WORKDIR/o.bpt.ucsc.fa" 2>/dev/null \
+    && check "UCSC twoBitToFa reads 2bit+IUB+bptree (degenerate=N)" "$ourstd" "$(seqonly_md5 "$WORKDIR/o.bpt.ucsc.fa")"
 fi
 if have samtools; then
   sam=$(seqonly_md5 "$WORKDIR/o.sam.fa")
@@ -171,6 +176,7 @@ bench "BGZF (seqformat)"       "$ENC_ITERS" enc_our_bgzf
 bench "2bit (seqformat)"       "$ENC_ITERS" enc_our_std
 bench "2bit+IUB (seqformat)"   "$ENC_ITERS" enc_our_iub
 bench "2bit+IUB+index (seqformat)" "$ENC_ITERS" enc_our_idx
+bench "2bit+IUB+bptree (seqformat)" "$ENC_ITERS" enc_our_bpt
 bench "4bit (seqformat)"       "$ENC_ITERS" enc_our_4bit
 bench "2be (seqformat)"        "$ENC_ITERS" enc_our_2be
 
@@ -182,6 +188,7 @@ bench "BGZF (seqformat)"      "$EXT_ITERS" ext_our_bgzf
 bench "2bit (seqformat)"      "$EXT_ITERS" ext_our_std
 bench "2bit+IUB (seqformat)"  "$EXT_ITERS" ext_our_iub
 bench "2bit+IUB+index (seqformat)" "$EXT_ITERS" ext_our_idx
+bench "2bit+IUB+bptree (seqformat)" "$EXT_ITERS" ext_our_bpt
 bench "4bit (seqformat)"      "$EXT_ITERS" ext_our_4bit
 bench "2be (seqformat)"       "$EXT_ITERS" ext_our_2be
 
@@ -203,6 +210,7 @@ pf_obgzf() { "$BIN" extract "$WORKDIR/our.fa.gz"    "${R0[$1]}" >/dev/null; }
 pf_std()   { "$BIN" extract "$WORKDIR/our.std.2bit" "${R0[$1]}" >/dev/null; }
 pf_iub()   { "$BIN" extract "$WORKDIR/our.iub.2bit" "${R0[$1]}" >/dev/null; }
 pf_idx()   { "$BIN" extract "$WORKDIR/our.idx.2bit" "${R0[$1]}" >/dev/null; }
+pf_bpt()   { "$BIN" extract "$WORKDIR/our.bpt.2bit" "${R0[$1]}" >/dev/null; }
 pf_4bit()  { "$BIN" extract "$WORKDIR/our.4bit"     "${R0[$1]}" >/dev/null; }
 pf_2be()   { "$BIN" extract "$WORKDIR/our.2be"      "${R0[$1]}" >/dev/null; }
 have twoBitToFa && lat "2bit (UCSC kentsrc)" pf_ucsc
@@ -211,6 +219,7 @@ have samtools && lat "BGZF (samtools)" pf_sam
 lat "2bit (seqformat)" pf_std
 lat "2bit+IUB (seqformat)" pf_iub
 lat "2bit+IUB+index (seqformat)" pf_idx
+lat "2bit+IUB+bptree (seqformat)" pf_bpt
 lat "4bit (seqformat)" pf_4bit
 lat "2be (seqformat)" pf_2be
 
