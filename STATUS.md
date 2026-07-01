@@ -59,12 +59,12 @@ ambiguity), `info`.
   whole file. Few-big per-fetch: ~45–53 ms → **~1.1 ms**, now *beating*
   `twoBitToFa` (8.2 ms). `cmd_extract` peeks a 64-byte prefix (`twobit::is_twobit`)
   to pick the seek path, and slurps via `from_vec` only for >1024 regions /
-  extract-all (so bulk-20k stays ~0.12 s). 4bit/2be/BGZF readers still slurp.
-- **2bit+IUB+index** now wins many-short per-fetch outright: **1.4 ms** (was 41.8
-  before seek) vs flat-TOC 164 ms, 2be 37 ms (2be still slurps — its B+ tree would
-  match ~1 ms with the same reader), `twoBitToFa` 89 ms, samtools 241 ms. It's the
-  only format winning both axes: O(log N) lookup *and* seek. README tables
-  refreshed 2026-06-29 with all of this.
+  extract-all (so bulk-20k stays ~0.12 s). Only 4bit still slurps (no index);
+  2be/BGZF/samtools now seek too — see the Remote/UDC bullet below.
+- **2bit+IUB+index and 2be tie the many-short per-fetch** at **1.4 ms** vs
+  flat-TOC 173 ms, `twoBitToFa` 89 ms, samtools 245 ms. (2be was 37 ms when it
+  slurped; now that it seeks, its B+ tree lands at 1.4 ms — the pointer array and
+  the tree are a wash locally, the tree wins remotely. See the Remote/UDC bullet.)
 - **Remote/UDC (new)**: a shared `Source` (`src/source.rs`; Mem/File/Http) gives
   **every** reader an HTTP range-read path — `ureq` agent with a pooled
   connection + UDC-style 8 KiB block cache. `seqformat::open_url()` auto-detects
@@ -106,7 +106,7 @@ ambiguity), `info`.
   family — `Source::Mem` allocates a Vec per positioned read, so the many-edit 2be
   decode does more small allocs. Per-fetch (seek) path is unaffected.
 - Flat-TOC (non-indexed) 2bit still builds a `String` HashMap of all names when a
-  name is looked up without the index → 164 ms on 500k seqs. The `--index` format
+  name is looked up without the index → 173 ms on 500k seqs. The `--index` format
   removes it; plain 2bit could also lazily binary-search a seek-read TOC.
 - 2be is a prototype: no `--long`-style 64-bit sequence-local coords (u32 caps a
   single sequence at 4 Gbp), no mask/IUB-only selective indexes.

@@ -200,11 +200,11 @@ B+ tree. Over the **web**, the B+ tree's higher fan-out pulls ahead on round-tri
 
 > ⁶ The flat-TOC 2bit reader is seek-based too (note ⁵), so it no longer reads the
 > whole 59 MB file — but with no name index it must still load the entire 500k-entry
-> TOC to resolve one name, and that O(N) load is the 164 ms (provable here: the
+> TOC to resolve one name, and that O(N) load is the 173 ms (provable here: the
 > *indexed* reader is the same reader minus this step and runs in 1.4 ms).
 > `twoBitToFa` pays the **same** O(N) load — kent's `twoBitOpen` also reads the whole
 > index into a name hash on open — so it too is in this slow regime at 89 ms, ~64×
-> the indexed reader. It's ~1.8× faster than *our* flat reader only by constant
+> the indexed reader. It's ~1.9× faster than *our* flat reader only by constant
 > factor: our `flat()` heap-allocates each name twice (the map key plus the `order`
 > vec) and uses Rust's SipHash, where kent keeps each name once in a `localmem`
 > arena with a lighter hash. The name index removes the load entirely; it does not
@@ -221,7 +221,7 @@ runs (assembly gaps). But scattered ambiguity yields one length-1 block each, at
 | config | N-blocks / 100 Mbp seq | 2bit standard | `twoBitToFa` 20k extract |
 |---|---|---|---|
 | N + IUB scattered (`0 / 0`) | ~1.5 M | 2.945 b/base (105 MiB) | 60–100 s |
-| N clustered, IUB scattered (`3 / 0`, default) | ~490 k | 2.315 b/base (83 MiB) | 17 s |
+| N clustered, IUB scattered (`3 / 0`, default) | ~490 k | 2.315 b/base (83 MiB) | ~20 s |
 | N + IUB clustered (`3 / 3`) | 6 | 2.000 b/base (75 MiB) | sub-second |
 
 Key point: because standard twoBit lumps `N` and every IUB code into one block
